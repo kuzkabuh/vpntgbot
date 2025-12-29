@@ -1,16 +1,18 @@
 """
 # ----------------------------------------------------------
-# Версия файла: 1.1.0
+# Версия файла: 1.2.0
 # Описание: ORM-модели SQLAlchemy для VPN backend
 #  - Location: локации (страны/регионы)
 #  - Server: VPN-сервера (WireGuard-ноды)
 #  - User: пользователи (Telegram)
 #  - SubscriptionPlan: тарифные планы (триал, 1/2/3 месяца и т.п.)
 #  - Subscription: подписки пользователей
+#  - VpnPeer: WireGuard-пиры (интеграция с WG-Easy)
 # Дата изменения: 2025-12-29
 # Изменения:
 #  - 1.0.0: добавлены модели Location и Server
 #  - 1.1.0: добавлены модели User, SubscriptionPlan, Subscription
+#  - 1.2.0: добавлена модель VpnPeer
 # ----------------------------------------------------------
 """
 
@@ -139,6 +141,7 @@ class User(Base):
     )
 
     subscriptions: Mapped[List["Subscription"]] = relationship("Subscription", back_populates="user")
+    vpn_peers: Mapped[List["VpnPeer"]] = relationship("VpnPeer", back_populates="user")
 
     def __repr__(self) -> str:
         return f"<User tg_id={self.telegram_id} username={self.username!r}>"
@@ -223,3 +226,35 @@ class Subscription(Base):
 
     def __repr__(self) -> str:
         return f"<Subscription user_id={self.user_id} plan_id={self.plan_id} active={self.is_active}>"
+
+
+# ======================
+# WIREGUARD PEERS
+# ======================
+
+
+class VpnPeer(Base):
+    """
+    WireGuard-пир, созданный через WG-Easy.
+    Привязан к пользователю и локации.
+    """
+
+    __tablename__ = "vpn_peers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+
+    wg_client_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
+    client_name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    location_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    location_name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    user: Mapped[User] = relationship("User", back_populates="vpn_peers")
+
+    def __repr__(self) -> str:
+        return f"<VpnPeer user_id={self.user_id} wg_client_id={self.wg_client_id!r}>"

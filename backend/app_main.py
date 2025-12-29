@@ -1,42 +1,41 @@
 # ----------------------------------------------------------
-# Версия файла: 1.1.0
+# Версия файла: 1.2.0
 # Описание: Backend VPN-проекта (FastAPI + PostgreSQL + WG-Easy)
 # Дата изменения: 2025-12-29
 #
 # Основное:
-#  - Загрузка конфигурации ТОЛЬКО из переменных окружения (.env)
+#  - Загрузка конфигурации из переменных окружения
 #  - Подключение к PostgreSQL через SQLAlchemy
 #  - Интеграция с WG-Easy через библиотеку wg-easy-api
-#  - Эндпоинты: /health, /api/v1/vpn/peers/create
+#  - Эндпоинты: /health, /api/v1/vpn/peers/create,
+#    /api/v1/users/from-telegram, /api/v1/users/{telegram_id}/subscription/active,
+#    /api/v1/users/{telegram_id}/trial/activate
 # ----------------------------------------------------------
 
 from __future__ import annotations
 
 import logging
-import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
-from sqlalchemy import (
-    Boolean,
-    Column,
-    DateTime,
-    ForeignKey,
-    Integer,
-    String,
-    create_engine,
-    func,
-    text,
-)
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
-
-# ВАЖНО: импорт в соответствии с подсказкой интерпретатора:
-# ImportError: Did you mean: 'WGEasy'?
+from sqlalchemy import select, text
+from sqlalchemy.orm import Session
 from wg_easy_api import WGEasy
+
+from config import get_settings
+from db import db_session, get_db
+from models import Subscription, SubscriptionPlan, User, VpnPeer
+from schemas import (
+    SubscriptionPlanOut,
+    SubscriptionStatusResponse,
+    TelegramUserIn,
+    TrialGrantResponse,
+    UserFromTelegramResponse,
+    UserOut,
+)
 
 # ----------------------------------------------------------
 # Логирование
@@ -49,134 +48,22 @@ logging.basicConfig(
 )
 
 # ----------------------------------------------------------
-# Конфигурация через переменные окружения (.env)
+# Конфигурация
 # ----------------------------------------------------------
 
-# Блок БД: либо используем BACKEND_DB_DSN, либо собираем DSN из DB_*.
-BACKEND_DB_DSN: Optional[str] = os.getenv("BACKEND_DB_DSN")
+settings = get_settings()
 
-DB_HOST: Optional[str] = os.getenv("DB_HOST")
-DB_PORT: Optional[str] = os.getenv("DB_PORT")
-DB_NAME: Optional[str] = os.getenv("DB_NAME")
-DB_USER: Optional[str] = os.getenv("DB_USER")
-DB_PASSWORD: Optional[str] = os.getenv("DB_PASSWORD")
-
-if BACKEND_DB_DSN:
-    DATABASE_URL = BACKEND_DB_DSN
-else:
-    # Собираем DSN из отдельных переменных; никаких паролей в коде по умолчанию
-    missing_vars = []
-    for key, value in [
-        ("DB_HOST", DB_HOST),
-        ("DB_PORT", DB_PORT),
-        ("DB_NAME", DB_NAME),
-        ("DB_USER", DB_USER),
-        ("DB_PASSWORD", DB_PASSWORD),
-    ]:
-        if not value:
-            missing_vars.append(key)
-
-    if missing_vars:
-        # Намеренно падаем, чтобы не было "тихих" ошибок конфигурации
-        raise RuntimeError(
-            f"Не заданы обязательные переменные окружения для БД: {', '.join(missing_vars)}"
-        )
-
-    DATABASE_URL = (
-        f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-    )
-
-logger.info("Используется DSN БД: %s", DATABASE_URL.replace(DB_PASSWORD or "", "****"))
-
-# WG-Easy (WG Dashboard)
-WG_EASY_URL: str = os.getenv("WG_EASY_URL", "http://wg_dashboard:51821")
-# Пароль не задаём по умолчанию в коде — только из окружения
-WG_EASY_PASSWORD: Optional[str] = os.getenv("WG_EASY_PASSWORD") or os.getenv(
-    "WG_DASHBOARD_PASSWORD"
-)
-
-if not WG_EASY_PASSWORD:
-    raise RuntimeError(
-        "Не задан пароль WG_EASY_PASSWORD или WG_DASHBOARD_PASSWORD в окружении. "
-        "Установи его в .env перед запуском backend."
-    )
-
-# Локация по умолчанию (Нидерланды)
-WG_DEFAULT_LOCATION_CODE: str = os.getenv("WG_DEFAULT_LOCATION_CODE", "eu-nl")
-WG_DEFAULT_LOCATION_NAME: str = os.getenv(
-    "WG_DEFAULT_LOCATION_NAME", "Нидерланды (по умолчанию)"
-)
+WG_DEFAULT_LOCATION_CODE = settings.default_location_code
+WG_DEFAULT_LOCATION_NAME = settings.default_location_name
 
 # ----------------------------------------------------------
 # Инициализация WG-Easy API клиента
 # ----------------------------------------------------------
 
-# Клиент асинхронный, но создавать его можно один раз
-wg_client = WGEasy(WG_EASY_URL, WG_EASY_PASSWORD)
+wg_client = WGEasy(settings.wg_easy_url, settings.wg_easy_password)
 
 # ----------------------------------------------------------
-# SQLAlchemy: Engine, Session, Base
-# ----------------------------------------------------------
-
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-
-def get_db() -> Session:
-    """
-    Зависимость FastAPI для работы с сессией БД.
-    """
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-# ----------------------------------------------------------
-# Модели БД
-# ----------------------------------------------------------
-
-
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    telegram_id = Column(String(64), unique=True, index=True, nullable=False)
-    telegram_username = Column(String(255), nullable=True)
-
-    created_at = Column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
-    )
-
-    vpn_peers = relationship("VpnPeer", back_populates="user")
-
-
-class VpnPeer(Base):
-    __tablename__ = "vpn_peers"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-
-    # ID клиента в WG-Easy (строка, так как wg-easy использует ObjectId-подобные идентификаторы)
-    wg_client_id = Column(String(128), unique=True, index=True, nullable=False)
-    client_name = Column(String(255), nullable=False)
-
-    location_code = Column(String(32), nullable=False)
-    location_name = Column(String(255), nullable=False)
-
-    is_active = Column(Boolean, default=True, nullable=False)
-
-    created_at = Column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
-    )
-
-    user = relationship("User", back_populates="vpn_peers")
-
-
-# ----------------------------------------------------------
-# Pydantic-схемы
+# Pydantic-схемы локально
 # ----------------------------------------------------------
 
 
@@ -195,6 +82,9 @@ class PeerCreateRequest(BaseModel):
     telegram_id: int = Field(..., description="Telegram ID пользователя")
     telegram_username: Optional[str] = Field(
         None, description="Username пользователя в Telegram"
+    )
+    device_name: Optional[str] = Field(
+        None, description="Имя устройства (если передано ботом)"
     )
     location_code: Optional[str] = Field(
         None, description="Код локации сервера (например, eu-nl)"
@@ -217,38 +107,129 @@ class PeerCreateResponse(BaseModel):
 
 
 # ----------------------------------------------------------
-# Утилиты для работы с БД
+# Утилиты
 # ----------------------------------------------------------
 
 
-def get_or_create_user(
-    db: Session, telegram_id: int, telegram_username: Optional[str]
-) -> User:
-    """
-    Находим пользователя по Telegram ID или создаём нового.
-    """
-    user = (
-        db.query(User)
-        .filter(User.telegram_id == str(telegram_id))
-        .one_or_none()
-    )
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def get_or_create_user(db: Session, payload: TelegramUserIn) -> tuple[User, bool]:
+    user = db.execute(
+        select(User).where(User.telegram_id == payload.telegram_id)
+    ).scalar_one_or_none()
+
     if user:
-        # Обновляем username, если поменялся
-        if telegram_username and user.telegram_username != telegram_username:
-            user.telegram_username = telegram_username
+        updated = False
+        if payload.username and user.username != payload.username:
+            user.username = payload.username
+            updated = True
+        if payload.first_name and user.first_name != payload.first_name:
+            user.first_name = payload.first_name
+            updated = True
+        if payload.last_name and user.last_name != payload.last_name:
+            user.last_name = payload.last_name
+            updated = True
+        if payload.language_code and user.language_code != payload.language_code:
+            user.language_code = payload.language_code
+            updated = True
+        if updated:
             db.add(user)
             db.commit()
             db.refresh(user)
-        return user
+        return user, False
 
     user = User(
-        telegram_id=str(telegram_id),
-        telegram_username=telegram_username,
+        telegram_id=payload.telegram_id,
+        username=payload.username,
+        first_name=payload.first_name,
+        last_name=payload.last_name,
+        language_code=payload.language_code,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
-    return user
+    return user, True
+
+
+def get_active_subscription(db: Session, user_id: int) -> Optional[Subscription]:
+    now = utcnow()
+    return (
+        db.execute(
+            select(Subscription)
+            .where(
+                Subscription.user_id == user_id,
+                Subscription.is_active.is_(True),
+                Subscription.ends_at >= now,
+            )
+            .order_by(Subscription.ends_at.desc())
+        )
+        .scalars()
+        .first()
+    )
+
+
+def has_had_trial(db: Session, user_id: int) -> bool:
+    return (
+        db.execute(
+            select(Subscription)
+            .join(SubscriptionPlan, Subscription.plan_id == SubscriptionPlan.id)
+            .where(
+                Subscription.user_id == user_id,
+                SubscriptionPlan.is_trial.is_(True),
+            )
+        )
+        .scalars()
+        .first()
+        is not None
+    )
+
+
+def get_or_create_trial_plan(db: Session) -> SubscriptionPlan:
+    plan = db.execute(
+        select(SubscriptionPlan).where(SubscriptionPlan.code == "trial_10")
+    ).scalar_one_or_none()
+    if plan:
+        return plan
+
+    plan = SubscriptionPlan(
+        code="trial_10",
+        name="Бесплатный триал на 10 дней",
+        duration_days=10,
+        price_stars=0,
+        is_trial=True,
+        is_active=True,
+        sort_order=0,
+        max_devices=None,
+    )
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+def build_subscription_status(db: Session, user: User) -> SubscriptionStatusResponse:
+    active = get_active_subscription(db, user.id)
+    trial_used = has_had_trial(db, user.id)
+
+    if active:
+        plan_name = active.plan.name if active.plan else None
+        return SubscriptionStatusResponse(
+            has_active_subscription=True,
+            is_trial_active=active.is_trial,
+            active_plan_name=plan_name,
+            subscription_ends_at=active.ends_at,
+            trial_available=not trial_used,
+        )
+
+    return SubscriptionStatusResponse(
+        has_active_subscription=False,
+        is_trial_active=False,
+        active_plan_name=None,
+        subscription_ends_at=None,
+        trial_available=not trial_used,
+    )
 
 
 # ----------------------------------------------------------
@@ -258,7 +239,7 @@ def get_or_create_user(
 app = FastAPI(
     title="VPN Service Backend",
     description="Backend-сервис для Telegram VPN-бота с интеграцией WG-Easy",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 # CORS при необходимости (можно ограничить доменами админки)
@@ -280,23 +261,19 @@ app.add_middleware(
 def on_startup() -> None:
     """
     Событие старта приложения:
-    - логируем используемый DSN
     - проверяем, что соединение с БД устанавливается
     """
     logger.info("vpn-backend: Старт backend-сервиса, инициализация БД...")
     try:
-        # Проверяем, что к БД реально можно подключиться и выполнить простой запрос
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-
+        with db_session() as session:
+            session.execute(text("SELECT 1"))
         logger.info("vpn-backend: Подключение к БД успешно, backend готов к работе.")
-    except Exception as e:
+    except Exception as exc:
         logger.error(
             "vpn-backend: Ошибка подключения к БД при старте: %s",
-            e,
+            exc,
             exc_info=True,
         )
-        # Если на старте не можем подключиться к БД — считаем это критической ошибкой
         raise
 
 
@@ -314,16 +291,124 @@ def health(db: Session = Depends(get_db)) -> HealthResponse:
     """
     db_ok = True
     try:
-        db.execute("SELECT 1")
+        db.execute(text("SELECT 1"))
     except Exception as exc:
         logger.error("Health-check: ошибка БД: %s", exc)
         db_ok = False
 
     return HealthResponse(
         status="ok" if db_ok else "degraded",
-        timestamp=datetime.utcnow(),
+        timestamp=utcnow(),
         database_ok=db_ok,
-        wg_easy_url=WG_EASY_URL,
+        wg_easy_url=settings.wg_easy_url,
+    )
+
+
+@app.post(
+    "/api/v1/users/from-telegram",
+    response_model=UserFromTelegramResponse,
+    summary="Регистрация/обновление пользователя из Telegram",
+)
+def register_user_from_telegram(
+    payload: TelegramUserIn,
+    db: Session = Depends(get_db),
+) -> UserFromTelegramResponse:
+    user, is_new = get_or_create_user(db, payload)
+    status_data = build_subscription_status(db, user)
+
+    return UserFromTelegramResponse(
+        user=UserOut.model_validate(user),
+        is_new=is_new,
+        has_active_subscription=status_data.has_active_subscription,
+        active_until=status_data.subscription_ends_at,
+        has_had_trial=not status_data.trial_available,
+        is_trial_active=status_data.is_trial_active,
+        active_plan_name=status_data.active_plan_name,
+        subscription_ends_at=status_data.subscription_ends_at,
+        trial_available=status_data.trial_available,
+    )
+
+
+@app.get(
+    "/api/v1/users/{telegram_id}/subscription/active",
+    response_model=SubscriptionStatusResponse,
+    summary="Получить статус активной подписки",
+)
+def get_subscription_status(
+    telegram_id: int,
+    db: Session = Depends(get_db),
+) -> SubscriptionStatusResponse:
+    user = db.execute(
+        select(User).where(User.telegram_id == telegram_id)
+    ).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пользователь не найден")
+
+    return build_subscription_status(db, user)
+
+
+@app.post(
+    "/api/v1/users/{telegram_id}/trial/activate",
+    response_model=TrialGrantResponse,
+    summary="Активировать бесплатный триал",
+)
+def activate_trial(
+    telegram_id: int,
+    db: Session = Depends(get_db),
+) -> TrialGrantResponse:
+    user = db.execute(
+        select(User).where(User.telegram_id == telegram_id)
+    ).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пользователь не найден")
+
+    trial_used = has_had_trial(db, user.id)
+    if trial_used:
+        return TrialGrantResponse(
+            success=False,
+            message="Бесплатный пробный период уже был использован ранее.",
+            trial_ends_at=None,
+            user=UserOut.model_validate(user),
+            plan=None,
+            already_had_trial=True,
+        )
+
+    active_subscription = get_active_subscription(db, user.id)
+    if active_subscription:
+        return TrialGrantResponse(
+            success=False,
+            message="У вас уже есть активная подписка. Триал недоступен.",
+            trial_ends_at=None,
+            user=UserOut.model_validate(user),
+            plan=None,
+            already_had_trial=False,
+        )
+
+    plan = get_or_create_trial_plan(db)
+    starts_at = utcnow()
+    ends_at = starts_at + timedelta(days=plan.duration_days)
+
+    subscription = Subscription(
+        user_id=user.id,
+        plan_id=plan.id,
+        server_id=None,
+        starts_at=starts_at,
+        ends_at=ends_at,
+        is_active=True,
+        is_trial=True,
+        source="trial",
+    )
+    db.add(subscription)
+    db.commit()
+    db.refresh(subscription)
+
+    return TrialGrantResponse(
+        success=True,
+        message="Бесплатный пробный период успешно активирован.",
+        trial_ends_at=subscription.ends_at,
+        user=UserOut.model_validate(user),
+        plan=SubscriptionPlanOut.model_validate(plan),
+        already_had_trial=False,
     )
 
 
@@ -342,32 +427,36 @@ async def create_vpn_peer(
     Логика:
       1) Находим/создаём пользователя по telegram_id.
       2) Проверяем, есть ли уже активный peer для этого пользователя в выбранной локации.
-         - если есть, просто возвращаем существующую конфигурацию;
+         - если есть, возвращаем существующую конфигурацию;
       3) Если нет — создаём нового клиента в WG-Easy, сохраняем его ID и возвращаем конфиг.
     """
 
-    # 1. Пользователь
-    user = get_or_create_user(
-        db=db,
-        telegram_id=payload.telegram_id,
-        telegram_username=payload.telegram_username,
+    user, _ = get_or_create_user(
+        db,
+        TelegramUserIn(
+            telegram_id=payload.telegram_id,
+            username=payload.telegram_username,
+            first_name=None,
+            last_name=None,
+            language_code=None,
+        ),
     )
 
     location_code = payload.location_code or WG_DEFAULT_LOCATION_CODE
     location_name = payload.location_name or WG_DEFAULT_LOCATION_NAME
 
-    # 2. Проверяем, есть ли уже peer в этой локации
-    existing_peer: Optional[VpnPeer] = (
-        db.query(VpnPeer)
-        .filter(
-            VpnPeer.user_id == user.id,
-            VpnPeer.location_code == location_code,
-            VpnPeer.is_active.is_(True),
+    existing_peer = (
+        db.execute(
+            select(VpnPeer).where(
+                VpnPeer.user_id == user.id,
+                VpnPeer.location_code == location_code,
+                VpnPeer.is_active.is_(True),
+            )
         )
-        .one_or_none()
+        .scalars()
+        .first()
     )
 
-    # WG-Easy работает асинхронно
     try:
         if existing_peer:
             logger.info(
@@ -387,8 +476,7 @@ async def create_vpn_peer(
                 config=config_text,
             )
 
-        # 3. Создаём нового клиента в WG-Easy
-        client_name = f"tg_{user.telegram_id}_{location_code}"
+        client_name = payload.device_name or f"tg_{user.telegram_id}_{location_code}"
 
         logger.info(
             "Создаём нового WG-клиента: user_id=%s, name=%s, location=%s",
@@ -398,14 +486,10 @@ async def create_vpn_peer(
         )
 
         new_client = await wg_client.create_client(client_name)
-
-        # Объект new_client имеет атрибут id (см. README wg-easy-api)
         wg_client_id: str = new_client.id
 
-        # Получаем конфиг клиента
         config_text: str = await wg_client.get_client_config(wg_client_id)
 
-        # Сохраняем в БД
         peer = VpnPeer(
             user_id=user.id,
             wg_client_id=wg_client_id,
@@ -427,7 +511,6 @@ async def create_vpn_peer(
         )
 
     except HTTPException:
-        # пробрасываем HTTPException как есть
         raise
     except Exception as exc:
         logger.exception("Ошибка при работе с WG-Easy: %s", exc)
