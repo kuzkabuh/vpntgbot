@@ -1,10 +1,10 @@
 <!--
-Версия файла: 1.0.0  
+Версия файла: 1.1.0  
 Описание: README для проекта VPN-платформы (WireGuard + WG-Easy + FastAPI + Telegram-бот)  
 Дата изменения: 2025-12-29
 -->
 
-# 🚀 KUZKA VPN Platform (vpntgbot) — v1.0.0
+# 🚀 KUZKA VPN Platform (vpntgbot) — v1.2.0
 
 **KUZKA VPN Platform** — это современная VPN-платформа на базе **WireGuard**, включающая:
 - панель управления **WG-Easy**;
@@ -133,6 +133,7 @@ WG_HOST=
 WG_DEFAULT_LOCATION_CODE=
 WG_DEFAULT_LOCATION_NAME=
 WG_DASHBOARD_PASSWORD_HASH=
+WG_EASY_PASSWORD=
 ```
 
 ### Бэкапы (будущее)
@@ -166,7 +167,7 @@ cd vpn-service
 cp .env.example .env
 nano .env
 ```
-Заполнить: пароли, токены, DSN, `WG_HOST`, `PASSWORD_HASH`.
+Заполнить: пароли, токены, DSN, `WG_HOST`, `WG_DASHBOARD_PASSWORD_HASH`, `WG_EASY_PASSWORD`.
 
 ---
 
@@ -240,12 +241,12 @@ sudo docker compose up -d wg_dashboard
 MAJOR.MINOR.PATCH
 ```
 
-Текущая версия: **v1.0.0**
+Текущая версия: **v1.2.0**
 
 Создание релиза:
 ```
-git tag -a v1.0.0 -m "Initial stable version 1.0.0"
-git push origin v1.0.0
+git tag -a v1.2.0 -m "Release 1.2.0"
+git push origin v1.2.0
 ```
 
 ---

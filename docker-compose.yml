@@ -1,5 +1,5 @@
 # ----------------------------------------------------------
-# Версия файла: 1.2.1
+# Версия файла: 1.2.2
 # Описание: Docker Compose для VPN-проекта
 #  - Postgres (db)
 #  - FastAPI backend (vpn_backend)
@@ -10,6 +10,7 @@
 # Изменения:
 #  - WG-Easy переведён с PASSWORD на PASSWORD_HASH (bcrypt)
 #  - зависимости backend -> db исправлены
+#  - добавлена переменная WG_EASY_PASSWORD для backend
 # ----------------------------------------------------------
 
 services:
@@ -41,6 +42,7 @@ services:
       - APP_HOST=${APP_HOST}
       - APP_PORT=${APP_PORT}
       - WG_EASY_URL=${WG_EASY_URL}
+      - WG_EASY_PASSWORD=${WG_EASY_PASSWORD}
       - WG_DEFAULT_LOCATION_CODE=${WG_DEFAULT_LOCATION_CODE}
       - WG_DEFAULT_LOCATION_NAME=${WG_DEFAULT_LOCATION_NAME}
       - MGMT_API_TOKEN=${MGMT_API_TOKEN}

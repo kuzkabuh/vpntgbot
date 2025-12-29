@@ -1,16 +1,18 @@
 """
 # ----------------------------------------------------------
-# Версия файла: 1.2.0
+# Версия файла: 1.3.0
 # Описание: Pydantic-схемы для API backend
 #  - ServerCreate, LocationOut, ServerOut
 #  - TelegramUserIn, UserOut, SubscriptionPlanOut
 #  - UserFromTelegramResponse
 #  - TrialGrantResponse
+#  - SubscriptionStatusResponse
 # Дата изменения: 2025-12-29
 # Изменения:
 #  - 1.0.0: схемы для ServerCreate, LocationOut, ServerOut
 #  - 1.1.0: добавлены схемы для пользователей и тарифов
 #  - 1.2.0: добавлена схема TrialGrantResponse для выдачи пробного периода
+#  - 1.3.0: добавлена схема SubscriptionStatusResponse и поля статуса подписки
 # ----------------------------------------------------------
 """
 
@@ -136,6 +138,22 @@ class UserFromTelegramResponse(BaseModel):
     has_active_subscription: bool
     active_until: Optional[datetime]
     has_had_trial: bool
+    is_trial_active: bool
+    active_plan_name: Optional[str] = None
+    subscription_ends_at: Optional[datetime] = None
+    trial_available: bool = False
+
+
+class SubscriptionStatusResponse(BaseModel):
+    """
+    Ответ на запрос статуса подписки пользователя.
+    """
+
+    has_active_subscription: bool
+    is_trial_active: bool
+    active_plan_name: Optional[str] = None
+    subscription_ends_at: Optional[datetime] = None
+    trial_available: bool = False
 
 
 class TrialGrantResponse(BaseModel):
@@ -151,3 +169,4 @@ class TrialGrantResponse(BaseModel):
     )
     user: UserOut
     plan: Optional[SubscriptionPlanOut] = None
+    already_had_trial: bool = False

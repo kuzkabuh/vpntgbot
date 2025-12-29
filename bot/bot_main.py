@@ -1,5 +1,5 @@
 """
-Версия файла: 1.3.0
+Версия файла: 1.4.0
 Описание: Telegram-бот для VPN-сервиса (меню тарифов, активация триала, запрос WireGuard-конфига)
 Дата изменения: 2025-12-29
 
@@ -103,8 +103,9 @@ async def call_backend(
 
         if resp.status_code >= 400:
             logger.warning("Backend вернул ошибку %s: %s", resp.status_code, data)
-            # для удобства в боте пробросим detail, если есть
-            raise RuntimeError(data.get("detail") if isinstance(data, dict) else f"HTTP {resp.status_code}")
+            raise RuntimeError(
+                data.get("detail") if isinstance(data, dict) else f"HTTP {resp.status_code}"
+            )
 
         return data
 
@@ -131,9 +132,10 @@ async def cmd_start(message: Message) -> None:
                 "username": user.username,
                 "first_name": user.first_name,
                 "last_name": user.last_name,
+                "language_code": user.language_code,
             },
         )
-    except Exception as exc:
+    except Exception:
         logger.exception("Ошибка при регистрации пользователя в backend")
         await message.answer(
             "Произошла ошибка при обращении к серверу.\n"
@@ -151,15 +153,17 @@ async def cmd_start(message: Message) -> None:
         "",
     ]
 
-    # простое описание текущего статуса
     has_sub = backend_resp.get("has_active_subscription", False)
     is_trial_active = backend_resp.get("is_trial_active", False)
     ends_at = backend_resp.get("subscription_ends_at")
     trial_available = backend_resp.get("trial_available", False)
+    plan_name = backend_resp.get("active_plan_name")
 
     if has_sub:
-        plan_name = backend_resp.get("active_plan_name") or "активный тариф"
-        greeting.append(f"Сейчас у вас есть <b>{html.escape(plan_name)}</b>.")
+        plan_label = plan_name or "активный тариф"
+        greeting.append(f"Сейчас у вас есть <b>{html.escape(plan_label)}</b>.")
+        if is_trial_active:
+            greeting.append("Тип: <b>бесплатный пробный период</b>.")
         if ends_at:
             greeting.append(f"Подписка действительна до: <code>{ends_at}</code>.")
     else:
@@ -181,7 +185,7 @@ async def cmd_help(message: Message) -> None:
         "Основные возможности:\n"
         "• Просмотр статуса подписки (кнопка «📊 Мой тариф и статус VPN»);\n"
         "• Активация бесплатного пробного периода (кнопка «🎁 Активировать бесплатный период»);\n"
-        "• Получение конфигурации WireGuard (кнопка «🔐 Получить конфиг WireGuard» — пока тестовая заглушка);\n"
+        "• Получение конфигурации WireGuard (кнопка «🔐 Получить конфиг WireGuard»);\n"
         "• Информация о проекте (кнопка «ℹ️ О проекте»).\n"
     )
     await message.answer(text, reply_markup=main_menu_keyboard())
@@ -200,7 +204,7 @@ async def handle_status(message: Message) -> None:
             method="GET",
             path=f"/api/v1/users/{user.id}/subscription/active",
         )
-    except Exception as exc:
+    except Exception:
         logger.exception("Ошибка при запросе статуса подписки")
         await message.answer("Ошибка при запросе статуса. Попробуйте позже.")
         return
@@ -285,7 +289,7 @@ async def handle_activate_trial(message: Message) -> None:
 
 @dp.message(F.text == "🔐 Получить конфиг WireGuard")
 async def handle_get_wireguard_config(message: Message) -> None:
-    """Запрос конфигурации WireGuard (пока заглушка, но цепочка бот -> backend работает)."""
+    """Запрос конфигурации WireGuard."""
     user = message.from_user
     if user is None:
         await message.answer("Не удалось определить пользователя Telegram.")
@@ -301,6 +305,7 @@ async def handle_get_wireguard_config(message: Message) -> None:
             path="/api/v1/vpn/peers/create",
             json={
                 "telegram_id": user.id,
+                "telegram_username": user.username,
                 "device_name": device_name,
             },
         )
@@ -313,17 +318,7 @@ async def handle_get_wireguard_config(message: Message) -> None:
         await message.answer("Ошибка при обращении к серверу. Попробуйте позже.")
         return
 
-    success = data.get("success", False)
-    msg = data.get("message", "")
-    config_text = data.get("config_text")
-
-    if not success:
-        text_lines = ["❗ Не удалось создать конфигурацию WireGuard."]
-        if msg:
-            text_lines.append("")
-            text_lines.append(html.escape(msg))
-        await message.answer("\n".join(text_lines), reply_markup=main_menu_keyboard())
-        return
+    config_text = data.get("config")
 
     if not config_text:
         await message.answer(
@@ -332,13 +327,11 @@ async def handle_get_wireguard_config(message: Message) -> None:
         )
         return
 
-    # Отправляем конфиг как текст (форматируем в <pre>)
     conf_escaped = html.escape(config_text)
     text = (
-        "<b>Ваш (пока тестовый) конфиг WireGuard:</b>\n\n"
+        "<b>Ваш конфиг WireGuard:</b>\n\n"
         f"<pre>{conf_escaped}</pre>\n\n"
-        "⚠️ Сейчас это демонстрационный пример. Как только интеграция с WG-Easy будет готова, "
-        "здесь будет выдаваться рабочий конфиг, уже привязанный к вашему VPN-подключению."
+        "⚠️ Если конфигурация не работает, напишите в поддержку."
     )
     await message.answer(text, reply_markup=main_menu_keyboard())
 
