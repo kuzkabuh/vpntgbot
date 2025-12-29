@@ -1,0 +1,128 @@
+# ----------------------------------------------------------
+# Версия файла: 1.2.1
+# Описание: Docker Compose для VPN-проекта
+#  - Postgres (db)
+#  - FastAPI backend (vpn_backend)
+#  - Telegram-бот (vpn_bot)
+#  - Nginx (vpn_nginx)
+#  - WG Dashboard (wg_dashboard, WG-Easy)
+# Дата изменения: 2025-12-29
+# Изменения:
+#  - WG-Easy переведён с PASSWORD на PASSWORD_HASH (bcrypt)
+#  - зависимости backend -> db исправлены
+# ----------------------------------------------------------
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: vpn_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./db-data:/var/lib/postgresql/data
+    networks:
+      - vpn_net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: vpn_backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BACKEND_DB_DSN=${BACKEND_DB_DSN}
+      - APP_ENV=${APP_ENV}
+      - APP_DEBUG=${APP_DEBUG}
+      - APP_HOST=${APP_HOST}
+      - APP_PORT=${APP_PORT}
+      - WG_EASY_URL=${WG_EASY_URL}
+      - WG_DEFAULT_LOCATION_CODE=${WG_DEFAULT_LOCATION_CODE}
+      - WG_DEFAULT_LOCATION_NAME=${WG_DEFAULT_LOCATION_NAME}
+      - MGMT_API_TOKEN=${MGMT_API_TOKEN}
+    depends_on:
+      - db
+      - wg_dashboard
+    networks:
+      - vpn_net
+
+  bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    container_name: vpn_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - BACKEND_BASE_URL=${BACKEND_BASE_URL}
+      - MGMT_API_TOKEN=${MGMT_API_TOKEN}
+    depends_on:
+      - backend
+    networks:
+      - vpn_net
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: vpn_nginx
+    restart: unless-stopped
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - vpn_net
+
+  wg_dashboard:
+    image: ghcr.io/wg-easy/wg-easy:latest
+    container_name: wg_dashboard
+    restart: unless-stopped
+
+    environment:
+      # UID/GID владельца файлов (обычно 1000:1000)
+      - PUID=1000
+      - PGID=1000
+
+      # Локаль интерфейса
+      - LANG=ru
+
+      # Публичный IP или домен сервера
+      - WG_HOST=${WG_HOST}
+
+      # ВАЖНО: теперь используем bcrypt-хеш
+      - PASSWORD_HASH=${WG_DASHBOARD_PASSWORD_HASH}
+
+      # Порты
+      - WG_PORT=51820
+      - PORT=51821
+
+      # DNS по умолчанию для клиентов VPN
+      - WG_DEFAULT_DNS=1.1.1.1
+
+    volumes:
+      - /etc/wireguard:/etc/wireguard
+
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+
+    ports:
+      - "51820:51820/udp"
+      - "51821:51821/tcp"
+
+    networks:
+      - vpn_net
+
+networks:
+  vpn_net:
+    driver: bridge
