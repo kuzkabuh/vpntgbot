@@ -1,18 +1,21 @@
 """
 # ----------------------------------------------------------
-# Версия файла: 1.3.0
+# Версия файла: 1.4.0
 # Описание: Pydantic-схемы для API backend
 #  - ServerCreate, LocationOut, ServerOut
 #  - TelegramUserIn, UserOut, SubscriptionPlanOut
 #  - UserFromTelegramResponse
 #  - TrialGrantResponse
 #  - SubscriptionStatusResponse
+#  - Admin: SubscriptionPlanCreate/Update, PeerList/PeerRevoke
 # Дата изменения: 2025-12-29
-# Изменения:
-#  - 1.0.0: схемы для ServerCreate, LocationOut, ServerOut
-#  - 1.1.0: добавлены схемы для пользователей и тарифов
-#  - 1.2.0: добавлена схема TrialGrantResponse для выдачи пробного периода
-#  - 1.3.0: добавлена схема SubscriptionStatusResponse и поля статуса подписки
+#
+# Изменения (1.4.0):
+#  - Приведены схемы к Pydantic v2 (model_config вместо class Config)
+#  - Добавлены схемы для админских эндпоинтов тарифов (create/update)
+#  - Добавлены схемы для peers (list/revoke) под меню бота
+#  - Уточнены типы (telegram_id как int, price_stars как float, даты как datetime UTC)
+#  - Добавлены базовые валидаторы/ограничения Field для критичных полей
 # ----------------------------------------------------------
 """
 
@@ -21,7 +24,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 # ======================
@@ -35,16 +38,18 @@ class ServerCreate(BaseModel):
     Используется bash-скриптом add_vpn_server.sh (позже).
     """
 
-    code: str = Field(..., description="Уникальный код сервера, например 'eu-nl-1'")
-    location_code: str = Field(..., description="Код локации, например 'eu-nl'")
-    location_name: str = Field(..., description="Название локации, например 'Нидерланды'")
-    public_ip: str = Field(..., description="Публичный IP-адрес сервера")
-    wg_port: int = Field(..., description="Порт WireGuard (UDP)")
-    vpn_subnet: str = Field(..., description="Внутренний VPN-адрес и маска, например '10.8.0.1/24'")
-    max_peers: Optional[int] = Field(None, description="Желаемый лимит пиров на ноде (опционально)")
+    code: str = Field(..., min_length=2, max_length=64, description="Уникальный код сервера, например 'eu-nl-1'")
+    location_code: str = Field(..., min_length=2, max_length=32, description="Код локации, например 'eu-nl'")
+    location_name: str = Field(..., min_length=2, max_length=128, description="Название локации, например 'Нидерланды'")
+    public_ip: str = Field(..., min_length=3, max_length=64, description="Публичный IP-адрес сервера")
+    wg_port: int = Field(..., ge=1, le=65535, description="Порт WireGuard (UDP)")
+    vpn_subnet: str = Field(..., min_length=3, max_length=32, description="Внутренний VPN-адрес и маска, например '10.8.0.1/24'")
+    max_peers: Optional[int] = Field(None, ge=1, description="Желаемый лимит пиров на ноде (опционально)")
 
 
 class LocationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     code: str
     name: str
@@ -54,11 +59,10 @@ class LocationOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
-
 
 class ServerOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     code: str
     public_ip: str
@@ -72,9 +76,6 @@ class ServerOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
-
 
 # ======================
 # ПОЛЬЗОВАТЕЛИ И ТАРИФЫ
@@ -86,30 +87,31 @@ class TelegramUserIn(BaseModel):
     Данные, которые бот отправляет в backend при первом /start.
     """
 
-    telegram_id: int = Field(..., description="Telegram ID пользователя")
-    username: Optional[str] = Field(None, description="username без @")
-    first_name: Optional[str] = Field(None, description="Имя")
-    last_name: Optional[str] = Field(None, description="Фамилия")
-    language_code: Optional[str] = Field(None, description="Код языка Telegram (ru, en и т.п.)")
+    telegram_id: int = Field(..., ge=1, description="Telegram ID пользователя")
+    username: Optional[str] = Field(None, max_length=64, description="username без @")
+    first_name: Optional[str] = Field(None, max_length=128, description="Имя")
+    last_name: Optional[str] = Field(None, max_length=128, description="Фамилия")
+    language_code: Optional[str] = Field(None, max_length=8, description="Код языка Telegram (ru, en и т.п.)")
 
 
 class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     telegram_id: int
-    username: Optional[str]
-    first_name: Optional[str]
-    last_name: Optional[str]
-    language_code: Optional[str]
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    language_code: Optional[str] = None
     is_blocked: bool
     is_admin: bool
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
-
 
 class SubscriptionPlanOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     code: str
     name: str
@@ -122,9 +124,6 @@ class SubscriptionPlanOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
-
 
 class UserFromTelegramResponse(BaseModel):
     """
@@ -136,7 +135,7 @@ class UserFromTelegramResponse(BaseModel):
     user: UserOut
     is_new: bool
     has_active_subscription: bool
-    active_until: Optional[datetime]
+    active_until: Optional[datetime] = None
     has_had_trial: bool
     is_trial_active: bool
     active_plan_name: Optional[str] = None
@@ -170,3 +169,55 @@ class TrialGrantResponse(BaseModel):
     user: UserOut
     plan: Optional[SubscriptionPlanOut] = None
     already_had_trial: bool = False
+
+
+# ======================
+# PEERS (для меню бота)
+# ======================
+
+
+class PeerListItem(BaseModel):
+    client_id: str = Field(..., description="WG-Easy client_id")
+    client_name: str = Field(..., description="Имя устройства/клиента")
+    location_code: str = Field(..., description="Код локации")
+    location_name: str = Field(..., description="Название локации")
+    is_active: bool = Field(..., description="Активен ли peer")
+    created_at: Optional[datetime] = Field(None, description="Дата создания (UTC)")
+    revoked_at: Optional[datetime] = Field(None, description="Дата деактивации (UTC)")
+
+
+class PeerListResponse(BaseModel):
+    telegram_id: int = Field(..., description="Telegram ID пользователя")
+    peers: list[PeerListItem]
+
+
+class PeerRevokeRequest(BaseModel):
+    telegram_id: int = Field(..., ge=1, description="Telegram ID пользователя")
+    client_id: str = Field(..., min_length=1, max_length=128, description="WG-Easy client_id, который нужно отозвать")
+    location_code: Optional[str] = Field(None, max_length=32, description="Опционально: локация для уточнения")
+
+
+# ======================
+# ADMIN (минимум для бота)
+# ======================
+
+
+class SubscriptionPlanCreate(BaseModel):
+    code: str = Field(..., min_length=2, max_length=32, description="Уникальный код тарифа (например, month_1)")
+    name: str = Field(..., min_length=2, max_length=128, description="Название тарифа")
+    duration_days: int = Field(..., ge=1, le=3650, description="Длительность в днях")
+    price_stars: float = Field(..., ge=0, description="Стоимость в Telegram Stars")
+    is_trial: bool = Field(False, description="Пробный тариф")
+    is_active: bool = Field(True, description="Активен/неактивен")
+    sort_order: int = Field(0, description="Порядок сортировки")
+    max_devices: Optional[int] = Field(None, ge=1, description="Лимит устройств (peers); null = безлимит")
+
+
+class SubscriptionPlanUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=2, max_length=128, description="Название тарифа")
+    duration_days: Optional[int] = Field(None, ge=1, le=3650, description="Длительность в днях")
+    price_stars: Optional[float] = Field(None, ge=0, description="Стоимость в Telegram Stars")
+    is_trial: Optional[bool] = Field(None, description="Пробный тариф")
+    is_active: Optional[bool] = Field(None, description="Активен/неактивен")
+    sort_order: Optional[int] = Field(None, description="Порядок сортировки")
+    max_devices: Optional[int] = Field(None, ge=1, description="Лимит устройств (peers); null = безлимит")

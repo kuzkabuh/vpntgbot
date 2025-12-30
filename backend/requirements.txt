@@ -1,9 +1,12 @@
 # ----------------------------------------------------------
-# Версия файла: 0.4.0
+# Версия файла: 0.5.0
 # Описание: Зависимости backend-сервиса VPN (FastAPI + SQLAlchemy + WG-Easy API)
 # Дата изменения: 2025-12-29
-# Изменения:
-#  - добавлен Alembic для миграций
+# Изменения (0.5.0):
+#  - добавлен httpx (нужен для wg-easy-api и/или проверок доступности)
+#  - добавлен greenlet (часто требуется SQLAlchemy 2.x в некоторых режимах)
+#  - добавлен typing-extensions (страховка для окружений)
+#  - оставлены pinned-версии, совместимые с FastAPI/Pydantic
 # ----------------------------------------------------------
 
 fastapi==0.115.0
@@ -11,11 +14,16 @@ uvicorn[standard]==0.32.0
 
 SQLAlchemy==2.0.36
 psycopg2-binary==2.9.9
+greenlet==3.1.1
 
 # Pydantic: версия должна удовлетворять и FastAPI, и wg-easy-api
 pydantic>=2.9.2,<3.0.0
+typing-extensions==4.12.2
 
 python-dotenv==1.0.1
+
+# HTTP client (wg-easy-api, возможные интеграции/пробы)
+httpx==0.27.2
 
 # Обёртка над WG-Easy HTTP API (требует Python >= 3.12 и pydantic >= 2.9.2)
 wg-easy-api==0.1.2

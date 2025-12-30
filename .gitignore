@@ -9,7 +9,11 @@
 *.env
 
 # Данные БД и бэкапы
+# Runtime / data
 db-data/
+wg-easy-data/
+certbot-etc/
+certbot-www/
 backups/
 *.sql
 *.dump

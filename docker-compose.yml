@@ -1,16 +1,25 @@
 # ----------------------------------------------------------
-# Версия файла: 1.2.2
-# Описание: Docker Compose для VPN-проекта
+# Версия файла: 1.3.1
+# Описание: Docker Compose для VPN-проекта (WG-Easy v15 + HTTPS через контейнер Certbot)
 #  - Postgres (db)
 #  - FastAPI backend (vpn_backend)
 #  - Telegram-бот (vpn_bot)
-#  - Nginx (vpn_nginx)
-#  - WG Dashboard (wg_dashboard, WG-Easy)
-# Дата изменения: 2025-12-29
-# Изменения:
-#  - WG-Easy переведён с PASSWORD на PASSWORD_HASH (bcrypt)
-#  - зависимости backend -> db исправлены
-#  - добавлена переменная WG_EASY_PASSWORD для backend
+#  - Nginx (vpn_nginx) — HTTPS на :51821
+#  - Certbot (certbot) — выпуск/обновление сертификата
+#  - WG Dashboard (wg_dashboard, WG-Easy v15)
+# Дата изменения: 2025-12-30
+#
+# Схема:
+#  - Публичный доступ к wg-easy UI только через Nginx:
+#    https://vpntgbot.kuzkabuh.ru:51821/
+#  - Certbot подтверждает домен по HTTP-01 через порт 80.
+#
+# ВАЖНО:
+# 1) Для выпуска сертификата порт 80/tcp должен быть открыт в firewall (UFW/провайдер).
+# 2) Nginx должен уметь стартовать до выпуска LE-серта:
+#    - либо используйте self-signed bootstrap в certbot-etc volume,
+#    - либо держите отдельный "http-only" конфиг на 80 до выпуска LE.
+# 3) wg_dashboard НЕ публикует 51821 наружу, только внутри сети docker.
 # ----------------------------------------------------------
 
 services:
@@ -36,16 +45,16 @@ services:
     env_file:
       - .env
     environment:
-      - BACKEND_DB_DSN=${BACKEND_DB_DSN}
-      - APP_ENV=${APP_ENV}
-      - APP_DEBUG=${APP_DEBUG}
-      - APP_HOST=${APP_HOST}
-      - APP_PORT=${APP_PORT}
-      - WG_EASY_URL=${WG_EASY_URL}
-      - WG_EASY_PASSWORD=${WG_EASY_PASSWORD}
-      - WG_DEFAULT_LOCATION_CODE=${WG_DEFAULT_LOCATION_CODE}
-      - WG_DEFAULT_LOCATION_NAME=${WG_DEFAULT_LOCATION_NAME}
-      - MGMT_API_TOKEN=${MGMT_API_TOKEN}
+      BACKEND_DB_DSN: ${BACKEND_DB_DSN}
+      APP_ENV: ${APP_ENV}
+      APP_DEBUG: ${APP_DEBUG}
+      APP_HOST: ${APP_HOST}
+      APP_PORT: ${APP_PORT}
+      WG_EASY_URL: ${WG_EASY_URL}
+      WG_EASY_PASSWORD: ${WG_EASY_PASSWORD}
+      WG_DEFAULT_LOCATION_CODE: ${WG_DEFAULT_LOCATION_CODE}
+      WG_DEFAULT_LOCATION_NAME: ${WG_DEFAULT_LOCATION_NAME}
+      MGMT_API_TOKEN: ${MGMT_API_TOKEN}
     depends_on:
       - db
       - wg_dashboard
@@ -61,9 +70,9 @@ services:
     env_file:
       - .env
     environment:
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - BACKEND_BASE_URL=${BACKEND_BASE_URL}
-      - MGMT_API_TOKEN=${MGMT_API_TOKEN}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      BACKEND_BASE_URL: http://backend:8000
+      MGMT_API_TOKEN: ${MGMT_API_TOKEN}
     depends_on:
       - backend
     networks:
@@ -73,58 +82,65 @@ services:
     image: nginx:1.27-alpine
     container_name: vpn_nginx
     restart: unless-stopped
-    volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d:ro
     ports:
       - "80:80"
+      - "51821:51821"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - certbot-www:/var/www/certbot            # <-- RW (ВАЖНО)
+      - certbot-etc:/etc/letsencrypt:ro
     depends_on:
-      - backend
+      - wg_dashboard
+    networks:
+      - vpn_net
+
+  certbot:
+    image: certbot/certbot:latest
+    container_name: vpn_certbot
+    restart: unless-stopped
+    volumes:
+      - certbot-etc:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+    entrypoint: /bin/sh -c
+    command: >
+      "trap exit TERM;
+       while :; do
+         certbot renew --webroot -w /var/www/certbot --quiet;
+         # если nginx запущен — мягко перезагружаем, чтобы он подхватил обновлённые сертификаты
+         (wget -qO- http://nginx:80/ >/dev/null 2>&1 && nginx -s reload) >/dev/null 2>&1 || true;
+         sleep 12h;
+       done"
     networks:
       - vpn_net
 
   wg_dashboard:
-    image: ghcr.io/wg-easy/wg-easy:latest
+    image: ghcr.io/wg-easy/wg-easy:15
     container_name: wg_dashboard
     restart: unless-stopped
-
     environment:
-      # UID/GID владельца файлов (обычно 1000:1000)
-      - PUID=1000
-      - PGID=1000
-
-      # Локаль интерфейса
-      - LANG=ru
-
-      # Публичный IP или домен сервера
-      - WG_HOST=${WG_HOST}
-
-      # ВАЖНО: теперь используем bcrypt-хеш
-      - PASSWORD_HASH=${WG_DASHBOARD_PASSWORD_HASH}
-
-      # Порты
-      - WG_PORT=51820
-      - PORT=51821
-
-      # DNS по умолчанию для клиентов VPN
-      - WG_DEFAULT_DNS=1.1.1.1
-
+      LANG: ru
     volumes:
-      - /etc/wireguard:/etc/wireguard
-
+      # Рекомендуется отдельная папка проекта, а не /etc/wireguard хоста
+      - ./wg-easy-data:/etc/wireguard
+      - /lib/modules:/lib/modules:ro
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
-
     sysctls:
-      - net.ipv4.conf.all.src_valid_mark=1
-
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.src_valid_mark: "1"
     ports:
+      # WireGuard UDP наружу оставляем
       - "51820:51820/udp"
-      - "51821:51821/tcp"
-
+      # ВАЖНО: 51821/tcp наружу НЕ публикуем! Его будет слушать nginx на хосте.
+      # - "51821:51821/tcp"
     networks:
       - vpn_net
 
 networks:
   vpn_net:
     driver: bridge
+
+volumes:
+  certbot-etc:
+  certbot-www:

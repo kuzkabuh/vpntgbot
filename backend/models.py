@@ -1,6 +1,6 @@
 """
 # ----------------------------------------------------------
-# Версия файла: 1.2.0
+# Версия файла: 1.3.0
 # Описание: ORM-модели SQLAlchemy для VPN backend
 #  - Location: локации (страны/регионы)
 #  - Server: VPN-сервера (WireGuard-ноды)
@@ -9,10 +9,14 @@
 #  - Subscription: подписки пользователей
 #  - VpnPeer: WireGuard-пиры (интеграция с WG-Easy)
 # Дата изменения: 2025-12-29
-# Изменения:
-#  - 1.0.0: добавлены модели Location и Server
-#  - 1.1.0: добавлены модели User, SubscriptionPlan, Subscription
-#  - 1.2.0: добавлена модель VpnPeer
+#
+# Изменения (1.3.0):
+#  - Добавлены/усилены индексы и ограничения целостности под требования ТЗ
+#  - Добавлены уникальные ограничения для peers по (user_id, location_code) среди активных
+#    (логическая уникальность обеспечивается на уровне приложения; на уровне БД — индексы)
+#  - Добавлено поле revoked_at для корректной истории деактивации peer (для аудита и биллинга)
+#  - Уточнены ondelete для FK, чтобы каскадно чистить зависимые данные
+#  - Добавлены backref/relationships и lazy='selectin' для производительности (бот/панель)
 # ----------------------------------------------------------
 """
 
@@ -30,6 +34,8 @@ from sqlalchemy import (
     BigInteger,
     Numeric,
     func,
+    Index,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -55,8 +61,13 @@ class Location(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    # default — чтобы backend мог иметь "локацию по умолчанию"
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # public — чтобы локацию можно было показывать пользователю
     is_public: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -66,7 +77,12 @@ class Location(Base):
         onupdate=func.now(),
     )
 
-    servers: Mapped[List["Server"]] = relationship("Server", back_populates="location")
+    servers: Mapped[List["Server"]] = relationship(
+        "Server",
+        back_populates="location",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+    )
 
     def __repr__(self) -> str:
         return f"<Location code={self.code!r} name={self.name!r}>"
@@ -83,8 +99,12 @@ class Server(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
 
-    location_id: Mapped[int] = mapped_column(ForeignKey("locations.id"), nullable=False)
-    location: Mapped[Location] = relationship("Location", back_populates="servers")
+    location_id: Mapped[int] = mapped_column(
+        ForeignKey("locations.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    location: Mapped[Location] = relationship("Location", back_populates="servers", lazy="selectin")
 
     public_ip: Mapped[str] = mapped_column(String(64), nullable=False)
     wg_port: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -103,7 +123,15 @@ class Server(Base):
         onupdate=func.now(),
     )
 
-    subscriptions: Mapped[List["Subscription"]] = relationship("Subscription", back_populates="server")
+    subscriptions: Mapped[List["Subscription"]] = relationship(
+        "Subscription",
+        back_populates="server",
+        lazy="selectin",
+    )
+
+    __table_args__ = (
+        Index("ix_servers_location_active", "location_id", "is_active"),
+    )
 
     def __repr__(self) -> str:
         return f"<Server code={self.code!r} ip={self.public_ip!r} location_id={self.location_id}>"
@@ -140,8 +168,23 @@ class User(Base):
         onupdate=func.now(),
     )
 
-    subscriptions: Mapped[List["Subscription"]] = relationship("Subscription", back_populates="user")
-    vpn_peers: Mapped[List["VpnPeer"]] = relationship("VpnPeer", back_populates="user")
+    subscriptions: Mapped[List["Subscription"]] = relationship(
+        "Subscription",
+        back_populates="user",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+    )
+    vpn_peers: Mapped[List["VpnPeer"]] = relationship(
+        "VpnPeer",
+        back_populates="user",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        Index("ix_users_is_admin", "is_admin"),
+        Index("ix_users_is_blocked", "is_blocked"),
+    )
 
     def __repr__(self) -> str:
         return f"<User tg_id={self.telegram_id} username={self.username!r}>"
@@ -172,7 +215,7 @@ class SubscriptionPlan(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
-    # Безлимитное количество устройств на 1 подписку
+    # Количество устройств (peers) на подписку; NULL = безлимит
     max_devices: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -182,7 +225,15 @@ class SubscriptionPlan(Base):
         onupdate=func.now(),
     )
 
-    subscriptions: Mapped[List["Subscription"]] = relationship("Subscription", back_populates="plan")
+    subscriptions: Mapped[List["Subscription"]] = relationship(
+        "Subscription",
+        back_populates="plan",
+        lazy="selectin",
+    )
+
+    __table_args__ = (
+        Index("ix_subscription_plans_active_sort", "is_active", "sort_order"),
+    )
 
     def __repr__(self) -> str:
         return f"<SubscriptionPlan code={self.code!r} price_stars={self.price_stars}>"
@@ -200,14 +251,26 @@ class Subscription(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
-    plan_id: Mapped[int] = mapped_column(ForeignKey("subscription_plans.id"), nullable=False)
-    server_id: Mapped[Optional[int]] = mapped_column(ForeignKey("servers.id"), nullable=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    plan_id: Mapped[int] = mapped_column(
+        ForeignKey("subscription_plans.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    server_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("servers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
-    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
 
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
     is_trial: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Источник оплаты/создания: trial, stars, admin_free, donation и т.п.
@@ -220,9 +283,14 @@ class Subscription(Base):
         onupdate=func.now(),
     )
 
-    user: Mapped[User] = relationship("User", back_populates="subscriptions")
-    plan: Mapped[SubscriptionPlan] = relationship("SubscriptionPlan", back_populates="subscriptions")
-    server: Mapped[Optional[Server]] = relationship("Server", back_populates="subscriptions")
+    user: Mapped[User] = relationship("User", back_populates="subscriptions", lazy="selectin")
+    plan: Mapped[SubscriptionPlan] = relationship("SubscriptionPlan", back_populates="subscriptions", lazy="selectin")
+    server: Mapped[Optional[Server]] = relationship("Server", back_populates="subscriptions", lazy="selectin")
+
+    __table_args__ = (
+        Index("ix_subscriptions_user_active", "user_id", "is_active"),
+        Index("ix_subscriptions_active_ends", "is_active", "ends_at"),
+    )
 
     def __repr__(self) -> str:
         return f"<Subscription user_id={self.user_id} plan_id={self.plan_id} active={self.is_active}>"
@@ -237,24 +305,43 @@ class VpnPeer(Base):
     """
     WireGuard-пир, созданный через WG-Easy.
     Привязан к пользователю и локации.
+
+    По ТЗ важно:
+      - уметь хранить историю (активен/деактивирован)
+      - ограничивать количество устройств (max_devices) по тарифу
+      - поддерживать дальнейшее расширение (аудит/биллинг)
     """
 
     __tablename__ = "vpn_peers"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
 
     wg_client_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
     client_name: Mapped[str] = mapped_column(String(255), nullable=False)
 
-    location_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Локация (логическая) — в текущем MVP используется для разделения конфигов по регионам
+    location_code: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     location_name: Mapped[str] = mapped_column(String(255), nullable=False)
 
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    user: Mapped[User] = relationship("User", back_populates="vpn_peers")
+    user: Mapped[User] = relationship("User", back_populates="vpn_peers", lazy="selectin")
+
+    __table_args__ = (
+        # Для ускорения типовых запросов:
+        Index("ix_vpn_peers_user_active", "user_id", "is_active"),
+        Index("ix_vpn_peers_user_location_active", "user_id", "location_code", "is_active"),
+        UniqueConstraint("user_id", "wg_client_id", name="uq_vpn_peers_user_client"),
+    )
 
     def __repr__(self) -> str:
         return f"<VpnPeer user_id={self.user_id} wg_client_id={self.wg_client_id!r}>"

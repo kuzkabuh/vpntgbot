@@ -1,0 +1,36 @@
+# 1) HTTP 80 - только для Let's Encrypt challenge
+server {
+    listen 80;
+    server_name vpntgbot.kuzkabuh.ru;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        try_files $uri =404;
+    }
+
+    # всё остальное можно редиректить на ваш https:51821
+    location / {
+        return 301 https://$host:51821$request_uri;
+    }
+}
+
+# 2) HTTPS на 51821 (ваше требование), проксируем на wg-easy
+server {
+    listen 51821 ssl;
+    server_name vpntgbot.kuzkabuh.ru;
+
+    ssl_certificate     /etc/letsencrypt/live/vpntgbot.kuzkabuh.ru/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/vpntgbot.kuzkabuh.ru/privkey.pem;
+
+    # (опционально) базовые настройки TLS
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    location / {
+        proxy_pass http://wg_dashboard:51821;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
