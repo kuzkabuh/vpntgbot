@@ -6,6 +6,19 @@
 
 # Changelog
 
+## [1.3.1] - 2025-12-30
+### Added
+- HTTPS access to WG-Easy via Nginx on port 51821
+- Certbot container with auto-renew
+
+### Changed
+- Upgraded WG-Easy to v15
+- Simplified and cleaned nginx configs
+
+### Fixed
+- Duplicate upstream issues
+- Certbot HTTP-01 challenge routing
+
 ## [1.2.0] - 2025-12-29
 ### Added
 - Внедрены миграции Alembic и первичная схема БД.

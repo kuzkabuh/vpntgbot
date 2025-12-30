@@ -1,45 +1,50 @@
 # ----------------------------------------------------------
-# Версия файла: 1.3.1
-# Описание: Backend VPN-проекта (FastAPI + PostgreSQL + WG-Easy)
-# Дата изменения: 2025-12-29
+# Версия файла: 1.4.6
+# Описание: Backend VPN-проекта (FastAPI + PostgreSQL + WG-Easy v14)
+# Дата изменения: 2025-12-30
 #
 # Основное:
 #  - Загрузка конфигурации из переменных окружения
 #  - Подключение к PostgreSQL через SQLAlchemy
-#  - Интеграция с WG-Easy через библиотеку wg-easy-api
+#  - Интеграция с WG-Easy через нативный HTTP-клиент (aiohttp) с корректным JSON
 #  - Эндпоинты:
 #       /health
 #       /api/v1/users/from-telegram
 #       /api/v1/users/{telegram_id}/subscription/active
 #       /api/v1/users/{telegram_id}/trial/activate
+#       /api/v1/subscription-plans/active
 #       /api/v1/vpn/peers/create
 #       /api/v1/vpn/peers/list
 #       /api/v1/vpn/peers/revoke
 #       /api/v1/admin/users
 #       /api/v1/admin/subscription-plans (list/create)
 #
-# Изменения (1.3.1):
-#  - Убрана обязательная зависимость от httpx (падал контейнер).
-#    WG probe теперь через urllib (stdlib) + опционально wg_easy_api.
-#  - Улучшено поведение revoke: выставляем revoked_at (если поле существует).
-#  - CORS: берем из settings.cors_origins если есть, иначе '*'.
+# Изменения (1.4.6):
+#  - Исправлено получение пароля WG-Easy:
+#      * ранее settings.wg_easy_password мог указывать на bcrypt-хеш (WG_EASY_PASSWORD_HASH),
+#        из-за чего backend логинился хешем и получал 401.
+#      * теперь backend ЯВНО берёт пароль из ENV WG_EASY_PASSWORD (plain), а если его нет —
+#        использует settings.wg_easy_password только если это НЕ bcrypt-хеш.
+#  - Улучшена диагностика: в лог добавляются длины и источник пароля (env/settings),
+#    без вывода самого пароля.
 # ----------------------------------------------------------
 
 from __future__ import annotations
 
 import logging
+import os
+import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
+from typing import Any, Optional, Tuple
 
+import aiohttp
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
-from wg_easy_api import WGEasy
 
 from config import get_settings
 from db import db_session, get_db
@@ -64,8 +69,246 @@ settings = get_settings()
 WG_DEFAULT_LOCATION_CODE = settings.default_location_code
 WG_DEFAULT_LOCATION_NAME = settings.default_location_name
 
-# WG-Easy клиент (через библиотеку)
-wg_client = WGEasy(settings.wg_easy_url, settings.wg_easy_password)
+_DEVICE_SAFE_RE = re.compile(r"[^a-zA-Z0-9_\-\.]+")
+_BCRYPT_RE = re.compile(r"^\$2[aby]\$\d{2}\$.{10,}$")  # "$2b$10$...." и т.п.
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _safe_str(v: Any) -> str:
+    try:
+        return str(v)
+    except Exception:
+        return "<unprintable>"
+
+
+def _looks_like_bcrypt_hash(value: str) -> bool:
+    v = (value or "").strip()
+    if not v:
+        return False
+    return _BCRYPT_RE.match(v) is not None
+
+
+def _resolve_wg_easy_password() -> tuple[str, str]:
+    """
+    Возвращает (password, source), где source: "env" | "settings".
+    Требование:
+      - для API /api/session нужен ПЛЕЙН пароль, а не bcrypt hash.
+    """
+    env_pass = (os.getenv("WG_EASY_PASSWORD") or "").strip()
+    if env_pass:
+        return env_pass, "env"
+
+    cfg_pass = str(getattr(settings, "wg_easy_password", "") or "").strip()
+    if cfg_pass and not _looks_like_bcrypt_hash(cfg_pass):
+        return cfg_pass, "settings"
+
+    # Если cfg_pass выглядит как bcrypt-хеш — это почти наверняка WG_EASY_PASSWORD_HASH
+    # и использовать его для /api/session нельзя.
+    return "", "settings"
+
+
+@dataclass
+class WGEasyHTTP:
+    """
+    Нативный HTTP-клиент WG-Easy (v14+) через aiohttp.
+    Работает так же, как успешный curl:
+      POST /api/session (JSON: {"password": "..."}), cookie connect.sid
+      POST /api/wireguard/client (JSON: {"name": "..."}), success=true
+      GET  /api/wireguard/client (JSON list)
+      GET  /api/wireguard/client/{id}/configuration (text wireguard config)
+      DELETE /api/wireguard/client/{id} (best-effort)
+    """
+
+    base_url: str
+    password: str
+    timeout_sec: float = 15.0
+
+    def base(self) -> str:
+        return (self.base_url or "").rstrip("/")
+
+    def _timeout(self) -> aiohttp.ClientTimeout:
+        return aiohttp.ClientTimeout(total=self.timeout_sec)
+
+    async def _request(
+        self,
+        session: aiohttp.ClientSession,
+        method: str,
+        path: str,
+        *,
+        json_data: Optional[dict] = None,
+        expected_status: int = 200,
+        return_json: bool = True,
+    ) -> Any:
+        url = f"{self.base()}{path}"
+        try:
+            async with session.request(method, url, json=json_data) as resp:
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+                body_text = await resp.text()
+
+                if resp.status != expected_status:
+                    raise aiohttp.ClientResponseError(
+                        request_info=resp.request_info,
+                        history=resp.history,
+                        status=resp.status,
+                        message=body_text[:1500],
+                        headers=resp.headers,
+                    )
+
+                if return_json:
+                    if "application/json" in content_type:
+                        return await resp.json()
+                    return body_text
+                return body_text
+        except aiohttp.ClientResponseError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"WG-Easy request failed: method={method} url={url} err={exc!r}") from exc
+
+    async def login(self, session: aiohttp.ClientSession) -> None:
+        data = await self._request(
+            session,
+            "POST",
+            "/api/session",
+            json_data={"password": self.password},
+            expected_status=200,
+            return_json=True,
+        )
+        if not isinstance(data, dict) or data.get("success") is not True:
+            raise RuntimeError(f"WG-Easy login failed: {data!r}")
+
+    async def session_info(self, session: aiohttp.ClientSession) -> dict:
+        data = await self._request(
+            session,
+            "GET",
+            "/api/session",
+            expected_status=200,
+            return_json=True,
+        )
+        if isinstance(data, dict):
+            return data
+        return {"raw": str(data)}
+
+    async def list_clients(self, session: aiohttp.ClientSession) -> list[dict]:
+        data = await self._request(
+            session,
+            "GET",
+            "/api/wireguard/client",
+            expected_status=200,
+            return_json=True,
+        )
+        if not isinstance(data, list):
+            raise RuntimeError(f"WG-Easy clients list unexpected: {data!r}")
+        return data
+
+    async def create_client(self, session: aiohttp.ClientSession, name: str) -> None:
+        data = await self._request(
+            session,
+            "POST",
+            "/api/wireguard/client",
+            json_data={"name": name},
+            expected_status=200,
+            return_json=True,
+        )
+        if not isinstance(data, dict) or data.get("success") is not True:
+            raise RuntimeError(f"WG-Easy create_client failed: {data!r}")
+
+    async def find_client_id_by_name(self, session: aiohttp.ClientSession, name: str) -> Optional[str]:
+        clients = await self.list_clients(session)
+        for c in clients:
+            if str(c.get("name") or "") == name:
+                cid = str(c.get("id") or "").strip()
+                if cid:
+                    return cid
+        return None
+
+    async def get_configuration(self, session: aiohttp.ClientSession, client_id: str) -> str:
+        cfg = await self._request(
+            session,
+            "GET",
+            f"/api/wireguard/client/{client_id}/configuration",
+            expected_status=200,
+            return_json=False,
+        )
+        return str(cfg or "")
+
+    async def delete_client(self, session: aiohttp.ClientSession, client_id: str) -> bool:
+        try:
+            await self._request(
+                session,
+                "DELETE",
+                f"/api/wireguard/client/{client_id}",
+                expected_status=200,
+                return_json=True,
+            )
+            return True
+        except aiohttp.ClientResponseError as exc:
+            if int(getattr(exc, "status", 0) or 0) in (204, 404):
+                return True
+            return False
+        except Exception:
+            return False
+
+    async def create_and_get_config(self, client_name: str) -> tuple[str, str]:
+        if not self.base():
+            raise RuntimeError("WG_EASY_URL пустой")
+        if not self.password:
+            raise RuntimeError("WG_EASY_PASSWORD пустой")
+
+        async with aiohttp.ClientSession(timeout=self._timeout()) as session:
+            await self.login(session)
+            await self.create_client(session, client_name)
+
+            cid = await self.find_client_id_by_name(session, client_name)
+            if not cid:
+                raise RuntimeError("WG-Easy: client создан, но id не найден в списке клиентов")
+
+            cfg = await self.get_configuration(session, cid)
+            if not cfg.strip():
+                raise RuntimeError("WG-Easy: конфиг пустой (configuration endpoint вернул пустую строку)")
+            return cid, cfg
+
+    async def get_config(self, client_id: str) -> str:
+        async with aiohttp.ClientSession(timeout=self._timeout()) as session:
+            await self.login(session)
+            return await self.get_configuration(session, client_id)
+
+    async def delete(self, client_id: str) -> bool:
+        async with aiohttp.ClientSession(timeout=self._timeout()) as session:
+            await self.login(session)
+            return await self.delete_client(session, client_id)
+
+
+def _init_wg_easy_client() -> WGEasyHTTP:
+    url = str(getattr(settings, "wg_easy_url", "") or "").strip()
+    password, source = _resolve_wg_easy_password()
+
+    if not url:
+        raise RuntimeError("WG_EASY_URL не задан в окружении backend.")
+
+    if not password:
+        cfg_hint = str(getattr(settings, "wg_easy_password", "") or "").strip()
+        if _looks_like_bcrypt_hash(cfg_hint):
+            raise RuntimeError(
+                "WG_EASY_PASSWORD не задан/пустой, а settings.wg_easy_password похож на bcrypt-хеш. "
+                "Для API /api/session нужен ПЛЕЙН пароль. Укажи WG_EASY_PASSWORD в .env (plain), "
+                "а WG_EASY_PASSWORD_HASH используй только для UI wg-easy."
+            )
+        raise RuntimeError("WG_EASY_PASSWORD не задан в окружении backend (нужен для логина в API WG-Easy).")
+
+    logger.info(
+        "WG-Easy init: url=%s; password_source=%s; password_len=%s",
+        url,
+        source,
+        len(password),
+    )
+
+    return WGEasyHTTP(base_url=url, password=password, timeout_sec=15.0)
+
+
+wg_client = _init_wg_easy_client()
 
 
 # -----------------------------
@@ -129,12 +372,64 @@ class SubscriptionPlanCreate(BaseModel):
     max_devices: Optional[int] = Field(None, ge=1, description="Лимит устройств (peers) на тариф")
 
 
+class PlansPublicResponse(BaseModel):
+    plans: list[SubscriptionPlanOut] = Field(..., description="Список активных тарифов")
+
+
 # -----------------------------
 # Утилиты
 # -----------------------------
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+def normalize_client_name(raw_name: str, fallback: str) -> str:
+    name = (raw_name or "").strip()
+    if not name:
+        name = fallback
+
+    name = name.replace(" ", "_")
+    name = _DEVICE_SAFE_RE.sub("", name)
+    if not name:
+        name = fallback
+
+    if len(name) > 48:
+        name = name[:48]
+    return name
+
+
+def _summarize_wg_error(exc: Exception) -> str:
+    parts: list[str] = [f"type={exc.__class__.__name__}"]
+
+    status_code = getattr(exc, "status", None)
+    message = getattr(exc, "message", None)
+
+    url = None
+    req_info = getattr(exc, "request_info", None)
+    if req_info is not None:
+        url = getattr(req_info, "real_url", None) or getattr(req_info, "url", None)
+    url = url or getattr(exc, "url", None)
+
+    if status_code is not None:
+        parts.append(f"status={_safe_str(status_code)}")
+    if message:
+        parts.append(f"message={_safe_str(message)}")
+    if url:
+        parts.append(f"url={_safe_str(url)}")
+
+    base = "; ".join(parts)
+
+    if str(status_code) == "500":
+        base += (
+            " | hint=WG-Easy 500 часто означает проблему внутри WG-Easy: исчерпан пул IP (/24 ~ 253 клиента), "
+            "повреждён /etc/wireguard, или ошибка конфигурации/volume."
+        )
+    if str(status_code) == "401":
+        base += (
+            " | hint=401 обычно означает неверный ПЛЕЙН пароль WG_EASY_PASSWORD для входа в WG-Easy API. "
+            "Проверь, что backend использует WG_EASY_PASSWORD, а не WG_EASY_PASSWORD_HASH."
+        )
+    if str(status_code) == "403":
+        base += " | hint=403 обычно означает запрет доступа/CSRF/неверная сессия. Проверь /api/session и cookie."
+
+    return base
 
 
 def get_or_create_user(db: Session, payload: TelegramUserIn) -> tuple[User, bool]:
@@ -308,42 +603,17 @@ def enforce_device_limit(db: Session, user: User, location_code: str, sub: Subsc
 
 
 async def wg_probe() -> Tuple[bool, Optional[str]]:
-    """
-    Проверка доступности WG-Easy:
-      1) Пытаемся дернуть API через библиотеку (если метод get_clients существует)
-      2) Fallback: TCP/HTTP доступность через urllib (без авторизации)
-    """
-    # 1) попытка через библиотеку
     try:
-        get_clients = getattr(wg_client, "get_clients", None)
-        if callable(get_clients):
-            await get_clients()
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5.0)) as session:
+            _ = await wg_client.session_info(session)
             return True, None
+    except aiohttp.ClientResponseError as exc:
+        code = int(getattr(exc, "status", 0) or 0)
+        if 200 <= code < 500:
+            return True, None
+        return False, f"wg-easy error: {_summarize_wg_error(exc)}"
     except Exception as exc:
-        # не считаем окончательно — попробуем TCP
-        lib_err = f"wg-easy api error: {exc}"
-    else:
-        lib_err = None
-
-    # 2) fallback: просто проверяем что вебка отвечает
-    try:
-        url = settings.wg_easy_url.rstrip("/")
-        req = Request(url, method="GET")
-        with urlopen(req, timeout=3) as resp:
-            code = getattr(resp, "status", 200)
-        # 200..499 — сервис жив (401/403 допустимы без авторизации)
-        if 200 <= int(code) < 500:
-            return True, None
-        return False, f"wg-easy unexpected status: {code}"
-    except HTTPError as exc:
-        # HTTPError — это тоже ответ сервиса (например 401/403)
-        if 200 <= exc.code < 500:
-            return True, None
-        return False, f"wg-easy http error: {exc.code}"
-    except URLError as exc:
-        return False, lib_err or f"wg-easy unreachable: {exc}"
-    except Exception as exc:
-        return False, lib_err or f"wg-easy probe failed: {exc}"
+        return False, f"wg-easy probe failed: {exc!r}"
 
 
 # -----------------------------
@@ -370,8 +640,8 @@ def require_mgmt_token(api_key: str = Depends(mgmt_api_header)) -> str:
 
 app = FastAPI(
     title="VPN Service Backend",
-    description="Backend-сервис для Telegram VPN-бота с интеграцией WG-Easy",
-    version="1.3.1",
+    description="Backend-сервис для Telegram VPN-бота с интеграцией WG-Easy (v14)",
+    version="1.4.6",
 )
 
 cors_origins = getattr(settings, "cors_origins", None) or ["*"]
@@ -408,7 +678,7 @@ async def health(db: Session = Depends(get_db)) -> HealthResponse:
     try:
         db.execute(text("SELECT 1"))
     except Exception as exc:
-        logger.error("Health-check: ошибка БД: %s", exc)
+        logger.error("Health-check: ошибка БД: %s", exc, exc_info=True)
         db_ok = False
         details = f"db error: {exc}"
 
@@ -529,6 +799,26 @@ def activate_trial(
     )
 
 
+@app.get(
+    "/api/v1/subscription-plans/active",
+    response_model=PlansPublicResponse,
+    summary="Публичный список активных тарифов (для бота/витрины)",
+)
+def public_active_plans(
+    db: Session = Depends(get_db),
+) -> PlansPublicResponse:
+    plans = (
+        db.execute(
+            select(SubscriptionPlan)
+            .where(SubscriptionPlan.is_active.is_(True))
+            .order_by(SubscriptionPlan.sort_order.asc(), SubscriptionPlan.id.asc())
+        )
+        .scalars()
+        .all()
+    )
+    return PlansPublicResponse(plans=[SubscriptionPlanOut.model_validate(p) for p in plans])
+
+
 @app.post(
     "/api/v1/vpn/peers/create",
     response_model=PeerCreateResponse,
@@ -570,7 +860,10 @@ async def create_vpn_peer(
 
     try:
         if existing_peer:
-            config_text: str = await wg_client.get_client_config(existing_peer.wg_client_id)
+            config_text = await wg_client.get_config(existing_peer.wg_client_id)
+            config_text = str(config_text or "")
+            if not config_text.strip():
+                raise RuntimeError("WG-Easy вернул пустой конфиг для существующего клиента")
             return PeerCreateResponse(
                 client_id=existing_peer.wg_client_id,
                 client_name=existing_peer.client_name,
@@ -579,11 +872,18 @@ async def create_vpn_peer(
                 config=config_text,
             )
 
-        client_name = payload.device_name or f"tg_{user.telegram_id}_{location_code}"
-        new_client = await wg_client.create_client(client_name)
-        wg_client_id: str = new_client.id
+        fallback_name = f"tg_{user.telegram_id}_{location_code}"
+        raw_name = payload.device_name or fallback_name
+        client_name = normalize_client_name(raw_name, fallback=fallback_name)
 
-        config_text: str = await wg_client.get_client_config(wg_client_id)
+        # Делаем имя уникальным для корректного поиска id по имени
+        unique_suffix = int(utcnow().timestamp())
+        if len(client_name) > 40:
+            client_name = client_name[:40]
+        client_name = f"{client_name}_{unique_suffix}"
+
+        wg_client_id, config_text = await wg_client.create_and_get_config(client_name=client_name)
+        config_text = str(config_text or "")
 
         peer = VpnPeer(
             user_id=user.id,
@@ -608,10 +908,16 @@ async def create_vpn_peer(
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Ошибка при работе с WG-Easy: %s", exc)
+        logger.error("Ошибка при работе с WG-Easy: %s", _summarize_wg_error(exc), exc_info=True)
+
+        hint = (
+            "WG-Easy вернул ошибку. Возможные причины: неверный пароль для API (нужен WG_EASY_PASSWORD, не hash), "
+            "исчерпан пул IP адресов (например /24 ≈ 253 клиента), либо проблема в данных WG-Easy (volume /etc/wireguard). "
+            "Проверь логи контейнера wg_dashboard."
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Ошибка при взаимодействии с WG-Easy, попробуйте позже.",
+            detail=hint,
         ) from exc
 
 
@@ -634,7 +940,7 @@ def list_vpn_peers(
         .all()
     )
 
-    result = []
+    result: list[PeerListItem] = []
     for p in peers:
         result.append(
             PeerListItem(
@@ -677,20 +983,17 @@ async def revoke_vpn_peer(
     if not peer.is_active:
         return {"ok": True, "message": "Peer уже деактивирован"}
 
-    # Пытаемся удалить/отключить клиента в WG-Easy (если метод доступен)
     try:
-        delete_client = getattr(wg_client, "delete_client", None)
-        disable_client = getattr(wg_client, "disable_client", None)
-
-        if callable(delete_client):
-            await delete_client(peer.wg_client_id)
-        elif callable(disable_client):
-            await disable_client(peer.wg_client_id)
+        ok = await wg_client.delete(peer.wg_client_id)
+        if not ok:
+            logger.warning(
+                "WG-Easy: не удалось удалить клиента (client_id=%s). Продолжаем деактивацию в БД.",
+                peer.wg_client_id,
+            )
     except Exception as exc:
-        logger.warning("Не удалось удалить/отключить клиента в WG-Easy: %s", exc)
+        logger.warning("WG-Easy: ошибка при удалении клиента: %s", _summarize_wg_error(exc), exc_info=True)
 
     peer.is_active = False
-    # если в модели есть revoked_at — фиксируем
     if hasattr(peer, "revoked_at"):
         setattr(peer, "revoked_at", utcnow())
 

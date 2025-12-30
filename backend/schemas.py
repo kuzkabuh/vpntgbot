@@ -1,21 +1,20 @@
 """
 # ----------------------------------------------------------
-# Версия файла: 1.4.0
+# Версия файла: 1.4.1
 # Описание: Pydantic-схемы для API backend
 #  - ServerCreate, LocationOut, ServerOut
 #  - TelegramUserIn, UserOut, SubscriptionPlanOut
 #  - UserFromTelegramResponse
 #  - TrialGrantResponse
 #  - SubscriptionStatusResponse
-#  - Admin: SubscriptionPlanCreate/Update, PeerList/PeerRevoke
-# Дата изменения: 2025-12-29
+#  - Peers: PeerList/PeerRevoke
+#  - Admin: SubscriptionPlanCreate/Update
+# Дата изменения: 2025-12-30
 #
-# Изменения (1.4.0):
-#  - Приведены схемы к Pydantic v2 (model_config вместо class Config)
-#  - Добавлены схемы для админских эндпоинтов тарифов (create/update)
-#  - Добавлены схемы для peers (list/revoke) под меню бота
-#  - Уточнены типы (telegram_id как int, price_stars как float, даты как datetime UTC)
-#  - Добавлены базовые валидаторы/ограничения Field для критичных полей
+# Изменения (1.4.1):
+#  - Исправлен обрыв файла (закрыты классы и добавлены недостающие окончания)
+#  - Сохранена совместимость с Pydantic v2 (ConfigDict/from_attributes)
+#  - Уточнены типы и ограничения Field для критичных полей
 # ----------------------------------------------------------
 """
 
@@ -24,8 +23,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field, ConfigDict
-
+from pydantic import BaseModel, ConfigDict, Field
 
 # ======================
 # СЕРВЕРА И ЛОКАЦИИ
@@ -43,8 +41,8 @@ class ServerCreate(BaseModel):
     location_name: str = Field(..., min_length=2, max_length=128, description="Название локации, например 'Нидерланды'")
     public_ip: str = Field(..., min_length=3, max_length=64, description="Публичный IP-адрес сервера")
     wg_port: int = Field(..., ge=1, le=65535, description="Порт WireGuard (UDP)")
-    vpn_subnet: str = Field(..., min_length=3, max_length=32, description="Внутренний VPN-адрес и маска, например '10.8.0.1/24'")
-    max_peers: Optional[int] = Field(None, ge=1, description="Желаемый лимит пиров на ноде (опционально)")
+    vpn_subnet: str = Field(..., min_length=3, max_length=32, description="VPN-сеть, например '10.8.0.1/24'")
+    max_peers: Optional[int] = Field(None, ge=1, description="Лимит пиров на ноде (опционально)")
 
 
 class LocationOut(BaseModel):
@@ -198,7 +196,7 @@ class PeerRevokeRequest(BaseModel):
 
 
 # ======================
-# ADMIN (минимум для бота)
+# ADMIN (минимум для бота/панели)
 # ======================
 
 
@@ -214,6 +212,11 @@ class SubscriptionPlanCreate(BaseModel):
 
 
 class SubscriptionPlanUpdate(BaseModel):
+    """
+    PATCH/UPDATE схема для тарифа (если добавите эндпоинт обновления).
+    Важно: max_devices=None должно означать 'безлимит', поэтому поле Optional[int].
+    """
+
     name: Optional[str] = Field(None, min_length=2, max_length=128, description="Название тарифа")
     duration_days: Optional[int] = Field(None, ge=1, le=3650, description="Длительность в днях")
     price_stars: Optional[float] = Field(None, ge=0, description="Стоимость в Telegram Stars")

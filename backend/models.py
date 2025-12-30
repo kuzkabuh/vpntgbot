@@ -1,22 +1,18 @@
 """
 # ----------------------------------------------------------
-# Версия файла: 1.3.0
+# Версия файла: 1.3.1
 # Описание: ORM-модели SQLAlchemy для VPN backend
 #  - Location: локации (страны/регионы)
 #  - Server: VPN-сервера (WireGuard-ноды)
 #  - User: пользователи (Telegram)
-#  - SubscriptionPlan: тарифные планы (триал, 1/2/3 месяца и т.п.)
+#  - SubscriptionPlan: тарифные планы
 #  - Subscription: подписки пользователей
 #  - VpnPeer: WireGuard-пиры (интеграция с WG-Easy)
-# Дата изменения: 2025-12-29
+# Дата изменения: 2025-12-30
 #
-# Изменения (1.3.0):
-#  - Добавлены/усилены индексы и ограничения целостности под требования ТЗ
-#  - Добавлены уникальные ограничения для peers по (user_id, location_code) среди активных
-#    (логическая уникальность обеспечивается на уровне приложения; на уровне БД — индексы)
-#  - Добавлено поле revoked_at для корректной истории деактивации peer (для аудита и биллинга)
-#  - Уточнены ondelete для FK, чтобы каскадно чистить зависимые данные
-#  - Добавлены backref/relationships и lazy='selectin' для производительности (бот/панель)
+# Изменения (1.3.1):
+#  - Файл приведён к целостному виду (без изменений бизнес-логики)
+#  - Оставлены индексы/ограничения, важные для производительности и целостности
 # ----------------------------------------------------------
 """
 
@@ -26,16 +22,16 @@ from datetime import datetime
 from typing import List, Optional
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
-    Integer,
-    String,
-    BigInteger,
-    Numeric,
-    func,
     Index,
+    Integer,
+    Numeric,
+    String,
     UniqueConstraint,
+    func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -62,12 +58,8 @@ class Location(Base):
     code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
 
-    # default — чтобы backend мог иметь "локацию по умолчанию"
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-
-    # public — чтобы локацию можно было показывать пользователю
     is_public: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -195,7 +187,7 @@ class SubscriptionPlan(Base):
     Тарифные планы:
       - триал (10 дней, бесплатно)
       - 1 месяц, 2 месяца, 3 месяца и т.д.
-    Цена указываем в Telegram Stars (цена в рублях задаётся отдельно в Telegram).
+    Цена указываем в Telegram Stars.
     """
 
     __tablename__ = "subscription_plans"
@@ -205,17 +197,14 @@ class SubscriptionPlan(Base):
     code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
 
-    # Длительность в днях (10, 30, 60, 90 и т.д.)
     duration_days: Mapped[int] = mapped_column(Integer, nullable=False)
 
-    # Цена в Telegram Stars (0 для триала)
     price_stars: Mapped[Numeric] = mapped_column(Numeric(10, 2), nullable=False)
 
     is_trial: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
-    # Количество устройств (peers) на подписку; NULL = безлимит
     max_devices: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -242,8 +231,8 @@ class SubscriptionPlan(Base):
 class Subscription(Base):
     """
     Подписка пользователя:
-      - на какой план
-      - на каком сервере (базовый или конкретная локация)
+      - план
+      - сервер (опционально)
       - триал или платная
     """
 
@@ -273,7 +262,6 @@ class Subscription(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
     is_trial: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
-    # Источник оплаты/создания: trial, stars, admin_free, donation и т.п.
     source: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -305,11 +293,6 @@ class VpnPeer(Base):
     """
     WireGuard-пир, созданный через WG-Easy.
     Привязан к пользователю и локации.
-
-    По ТЗ важно:
-      - уметь хранить историю (активен/деактивирован)
-      - ограничивать количество устройств (max_devices) по тарифу
-      - поддерживать дальнейшее расширение (аудит/биллинг)
     """
 
     __tablename__ = "vpn_peers"
@@ -325,7 +308,6 @@ class VpnPeer(Base):
     wg_client_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
     client_name: Mapped[str] = mapped_column(String(255), nullable=False)
 
-    # Локация (логическая) — в текущем MVP используется для разделения конфигов по регионам
     location_code: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     location_name: Mapped[str] = mapped_column(String(255), nullable=False)
 
@@ -337,7 +319,6 @@ class VpnPeer(Base):
     user: Mapped[User] = relationship("User", back_populates="vpn_peers", lazy="selectin")
 
     __table_args__ = (
-        # Для ускорения типовых запросов:
         Index("ix_vpn_peers_user_active", "user_id", "is_active"),
         Index("ix_vpn_peers_user_location_active", "user_id", "location_code", "is_active"),
         UniqueConstraint("user_id", "wg_client_id", name="uq_vpn_peers_user_client"),

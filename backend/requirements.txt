@@ -30,3 +30,4 @@ wg-easy-api==0.1.2
 
 # Миграции БД
 alembic==1.14.0
+requests==2.32.3

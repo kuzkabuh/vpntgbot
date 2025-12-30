@@ -1,0 +1,241 @@
+.
+├── AI_AGENTS_GUIDE.md
+├── backend
+│   ├── alembic
+│   │   ├── env.py
+│   │   ├── script.py.mako
+│   │   └── versions
+│   │       └── 20251229_001_initial_schema.py
+│   ├── alembic.ini
+│   ├── app
+│   │   └── integrations
+│   │       └── wg_easy.py
+│   ├── app_main.py
+│   ├── config.py
+│   ├── db.py
+│   ├── Dockerfile
+│   ├── models.py
+│   ├── requirements.txt
+│   └── schemas.py
+├── backups
+├── bot
+│   ├── bot_main.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── CHANGELOG.md
+├── db-data  [error opening dir]
+├── deploy
+│   ├── backup_db.sh
+│   └── nginx
+│       └── vpn_backend.conf
+├── docker-compose.yml
+├── .env
+├── .env.example
+├── .git
+│   ├── branches
+│   ├── COMMIT_EDITMSG
+│   ├── config
+│   ├── description
+│   ├── FETCH_HEAD
+│   ├── HEAD
+│   ├── hooks
+│   │   ├── applypatch-msg.sample
+│   │   ├── commit-msg.sample
+│   │   ├── fsmonitor-watchman.sample
+│   │   ├── post-update.sample
+│   │   ├── pre-applypatch.sample
+│   │   ├── pre-commit.sample
+│   │   ├── pre-merge-commit.sample
+│   │   ├── prepare-commit-msg.sample
+│   │   ├── pre-push.sample
+│   │   ├── pre-rebase.sample
+│   │   ├── pre-receive.sample
+│   │   ├── push-to-checkout.sample
+│   │   ├── sendemail-validate.sample
+│   │   └── update.sample
+│   ├── index
+│   ├── info
+│   │   └── exclude
+│   ├── logs
+│   │   ├── HEAD
+│   │   └── refs
+│   │       ├── heads
+│   │       └── remotes
+│   ├── objects
+│   │   ├── 01
+│   │   │   └── 04fea5140573ba0d561764a78df6277e1eb8af
+│   │   ├── 02
+│   │   │   └── ddf301abe053cb59736bbf03416b1c4b290909
+│   │   ├── 04
+│   │   │   └── c366c01b9f6f7060022b966eedfbd83f5cf79d
+│   │   ├── 05
+│   │   │   └── 47af4c7ae133cd4003a2ddc7bc26642098dab0
+│   │   ├── 0b
+│   │   │   └── 41f0ec770cb65946bf69c908f27013a0a129dc
+│   │   ├── 0d
+│   │   │   └── 9420a8b608cb526653fa6b28dd45e0afbf69e9
+│   │   ├── 13
+│   │   │   └── bd2ddd418e9a6a55e414a514cf96b3642fc0cd
+│   │   ├── 18
+│   │   │   └── 77e347ac4ce06e2b08026f1ef79aad38b58670
+│   │   ├── 1a
+│   │   │   └── 679dafa286df79c019418150c8a8baa39c3919
+│   │   ├── 1f
+│   │   │   └── 59321d4aabc132038fef7afa648036833ace70
+│   │   ├── 24
+│   │   │   └── 12738b04f85132cac9d356246f18c6328a3281
+│   │   ├── 28
+│   │   │   ├── 13f5b02509e0e495e6cf2d79c5d7a7b915ce21
+│   │   │   └── 4dfb9b41510bed792d089566c364eb29c0d44a
+│   │   ├── 2b
+│   │   │   └── d7f00faf7a59bfbfc4eedc1072281a7d10158b
+│   │   ├── 2c
+│   │   │   └── c0f22dfd7a62d750f073fefb287acc98350c51
+│   │   ├── 2e
+│   │   │   └── 64f67bcdeb216882e0cf2992dd3654952705fd
+│   │   ├── 30
+│   │   │   └── a3f9029a70125e2c8a91315833084ba6556528
+│   │   ├── 35
+│   │   │   └── f3cf30aaf0acbd91463cd45fbe5c7b35e9f0fd
+│   │   ├── 3a
+│   │   │   └── 68db7e240edee87ebd506b87b2bb635aa1ca5c
+│   │   ├── 3f
+│   │   │   └── b95c8f785fbee3cc700b525aa7de227494f892
+│   │   ├── 45
+│   │   │   ├── 20609d13c51d9c68d28023d7661aa7f0c35544
+│   │   │   └── 219d3fd63bae7f40a35bb027f181eb665e89f6
+│   │   ├── 4c
+│   │   │   └── 9e8e720c29a00ffae9f80db416410fadb5ed4f
+│   │   ├── 4d
+│   │   │   └── 803181714966e32add8e9dbb4dc22f2404a95e
+│   │   ├── 58
+│   │   │   └── a09778e543e5b96935dc2e8e18c2cff4b63a5c
+│   │   ├── 5a
+│   │   │   └── 1c4c5d9e653dcfd722b629a448b2d33c5978ea
+│   │   ├── 5b
+│   │   │   └── db222e0d3471066b2f24518010d92ec59533cf
+│   │   ├── 5e
+│   │   │   └── a13096bb8847b222ba0122caf2b24fd0ab8dcd
+│   │   ├── 5f
+│   │   │   └── 2a20428b221e7d56c0291083d12928678aef3d
+│   │   ├── 61
+│   │   │   └── 41b80ae9334214a2eee23c9964d9d842250eee
+│   │   ├── 62
+│   │   │   └── 0c0b25e8f4328d62ace634457c69fda7f7852d
+│   │   ├── 63
+│   │   │   └── 725175fdaf90654aa2f3318ebc50858a28a4a2
+│   │   ├── 6a
+│   │   │   ├── 58cef91743890194000a8e9230724dbc4ec093
+│   │   │   └── cf8e8dccb904a4cb78cd048dad32937dd8ad2f
+│   │   ├── 6f
+│   │   │   └── 2e48c51482efaafed1ef14908f12b9f759b6e0
+│   │   ├── 73
+│   │   │   └── 6798d5da686647ae31294f5d41e85585422fb3
+│   │   ├── 75
+│   │   │   └── dd9333f40d734cfe082e729fc1815280ecdeec
+│   │   ├── 76
+│   │   │   └── 08802adb58c5dd6236702dc3ba992a43e546fb
+│   │   ├── 7b
+│   │   │   └── 268cd4274ec0031f34787a5fd6eefa4aa57bce
+│   │   ├── 80
+│   │   │   ├── 1643f24786d630ba154737ea2dd095357c0c87
+│   │   │   └── b7b84a0a94f6536bab0406207f398f9c3b2e3b
+│   │   ├── 89
+│   │   │   └── 9ceaf5d11a1f7ccf8e6095a04d05e4c8ebb2f2
+│   │   ├── 8f
+│   │   │   └── 63905efd1713db60cfcf3c83e92870927df383
+│   │   ├── 90
+│   │   │   └── e8a00535af3edadfb0065ef4f2d9a6ea765828
+│   │   ├── 93
+│   │   │   └── 2cbbd007b569f1284d5f740d3546cb72ead7bc
+│   │   ├── 94
+│   │   │   └── 44bce4ce6ab3f5b542943e62707d0fac8d351d
+│   │   ├── 98
+│   │   │   ├── 42345941a66b08e6f080ece798aa235656813d
+│   │   │   └── 9b1953db0dacf19c0ac6a125429cf98a03be3f
+│   │   ├── 9b
+│   │   │   └── ead605873310266b04e8e01fde132a722354c5
+│   │   ├── a1
+│   │   │   └── 539796a866dcf5896fb77edba6bf9c502ce5df
+│   │   ├── a2
+│   │   │   └── fc2ade105e803d4b42b660bb45241d4ad4789a
+│   │   ├── a4
+│   │   │   └── 015ba931f88f89cca87a89559ca5c86c0e4578
+│   │   ├── a8
+│   │   │   └── 39f56e267d27536a572e74dd54a6a06f6f8841
+│   │   ├── ab
+│   │   │   ├── 028cfa86cd0d3cb1b7d0e8b15f2710a8ed253a
+│   │   │   └── 6eca83316744f6b85ca49a2612ad69ee004117
+│   │   ├── ac
+│   │   │   └── 9677c0a966817e3bc926aeda8dd94d80d6677c
+│   │   ├── ae
+│   │   │   └── 7ac641cd786e1d074c60711824391f3171ec36
+│   │   ├── b1
+│   │   │   └── bee2ae79b2cc147f17662c0757d4345d29154f
+│   │   ├── c2
+│   │   │   └── 341515af23bb16eb692898fb6769dc0bb13f02
+│   │   ├── c3
+│   │   │   └── 97dbb08e71e4c9a48996d8c841b98855ad791a
+│   │   ├── c4
+│   │   │   ├── 999e2236d2de1205acfa1b68400f3c6b082e32
+│   │   │   └── 9eb35854d573e906d110f969eeae435fcf76ef
+│   │   ├── c5
+│   │   │   └── 3aa9bc044d74504b251dc8749f064c2b32ec5f
+│   │   ├── c6
+│   │   │   ├── 5162730d939088c71b166a6d1875faad437e20
+│   │   │   ├── 7399bcc325bd6188963876e3d50a49048d6e96
+│   │   │   └── f400e2c3aca89131ec2c6290e3e516351d26b4
+│   │   ├── cb
+│   │   │   ├── 49f5c53902e16d18392cf8787a52a548d7af57
+│   │   │   └── 925a73f47400b15d90868b69bc63ba2a982c8f
+│   │   ├── cc
+│   │   │   └── 8b62a1357e308abd3a52852acebc48da920021
+│   │   ├── d2
+│   │   │   └── aed7944b4666ad66225440bb6cea94411c6ded
+│   │   ├── d3
+│   │   │   └── b02bf4fc7946cf33711052b4532704f8198583
+│   │   ├── dc
+│   │   │   └── f4e1a48e8ad4485bbf27e486f5e1164f5f4d41
+│   │   ├── df
+│   │   │   └── 9a471631a60a70ade1ed873e519b53444526ed
+│   │   ├── e7
+│   │   │   └── 42ef890ed3d1f8394aa3c3f4635c342944f882
+│   │   ├── e9
+│   │   │   └── eef94e5a325d2c780ec22ce7408bf69e5b76b1
+│   │   ├── f0
+│   │   │   └── db8b3847467bdfb8721f34783a8a1bc1621c6a
+│   │   ├── f4
+│   │   │   └── 2c17758aa1e5f44511c89af961770a60c9cfe3
+│   │   ├── f7
+│   │   │   └── 25b517423ce0f3c993648dec3da5da41842784
+│   │   ├── fd
+│   │   │   └── 7579d446817c8275c6349e044e7f8ea5290ca3
+│   │   ├── fe
+│   │   │   └── 949da822cd05cd46ed00214979e456c9f0753a
+│   │   ├── info
+│   │   └── pack
+│   ├── ORIG_HEAD
+│   └── refs
+│       ├── heads
+│       │   └── main
+│       ├── remotes
+│       │   └── origin
+│       └── tags
+│           ├── v1.0.0
+│           └── v1.3.1
+├── .gitignore
+├── nginx
+│   └── conf.d
+│       ├── 00_acme_http.conf
+│       ├── 10_wg_easy_https_51821.conf
+│       ├── 10_wg_easy_https.conf.disabled
+│       ├── vpn_backend.conf.disabled
+│       ├── wg_easy.conf.disabled
+│       └── wg_easy_ssl_51821.conf.disabled
+├── PROJECT_STRUCTURE.txt
+├── README.md
+└── wg-easy-data
+    ├── wg0.conf
+    └── wg-easy.db
+
+100 directories, 139 files

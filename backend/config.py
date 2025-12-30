@@ -1,15 +1,12 @@
 """
 # ----------------------------------------------------------
-# Версия файла: 1.2.0
+# Версия файла: 1.2.1
 # Описание: Конфигурация backend-приложения (загрузка ENV)
-# Дата изменения: 2025-12-29
+# Дата изменения: 2025-12-30
 #
-# Изменения (1.2.0):
-#  - Добавлена строгая валидация переменных окружения под требования ТЗ
-#  - Поддержка WG_EASY_PASSWORD_HASH (предпочтительно) + fallback на WG_EASY_PASSWORD (legacy)
-#  - Добавлены настройки Security/RBAC задел: ADMIN_TELEGRAM_IDS, CORS_ORIGINS, RATE_LIMIT
-#  - Улучшено формирование DSN и сообщения об ошибках
-#  - Убраны небезопасные/скрытые дефолты для критичных параметров
+# Изменения (1.2.1):
+#  - Добавлена переменная WG_EASY_USERNAME (логин для WG-Easy API, по умолчанию 'admin')
+#  - Валидация: username обязателен (не пустой)
 # ----------------------------------------------------------
 """
 
@@ -90,6 +87,7 @@ class Settings:
     # WG-Easy
     # -----------------------
     wg_easy_url: str
+    wg_easy_username: str
     wg_easy_password: str  # password/plain OR password_hash (в зависимости от вашей обвязки)
 
     # -----------------------
@@ -126,6 +124,11 @@ class Settings:
 
         # WG-Easy URL: допустим дефолт внутри docker-сети
         wg_easy_url = _getenv("WG_EASY_URL", "http://wg_dashboard:51821") or "http://wg_dashboard:51821"
+
+        # WG-Easy username (ВАЖНО: у тебя 'artem', а не 'admin')
+        wg_easy_username = _getenv("WG_EASY_USERNAME", "artem") or "admin"
+        if not wg_easy_username.strip():
+            raise RuntimeError("WG_EASY_USERNAME не должен быть пустым.")
 
         # Предпочтительно: WG_EASY_PASSWORD_HASH (если вы используете HASH)
         # Fallback: WG_EASY_PASSWORD (legacy)
@@ -164,6 +167,7 @@ class Settings:
             default_location_code=default_location_code,
             default_location_name=default_location_name,
             wg_easy_url=wg_easy_url,
+            wg_easy_username=wg_easy_username,
             wg_easy_password=wg_easy_password,
             cors_origins=cors_origins,
             admin_telegram_ids=admin_telegram_ids,

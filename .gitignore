@@ -38,3 +38,25 @@ __pycache__/
 # Системные файлы
 .DS_Store
 Thumbs.db
+
+# --- runtime data / backups (MUST NOT be committed) ---
+wg-easy-data/
+wg-easy-data.backup_*/
+db-data/
+backups/
+*.log
+
+# certbot/letsencrypt runtime
+certbot-etc/
+certbot-www/
+letsencrypt/
+
+# env / secrets
+.env
+.env.*
+*.env
+
+# python caches
+__pycache__/
+*.pyc
+.venv/
