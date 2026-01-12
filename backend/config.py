@@ -1,12 +1,14 @@
 """
 # ----------------------------------------------------------
-# Версия файла: 1.2.1
+# Версия файла: 1.2.2
 # Описание: Конфигурация backend-приложения (загрузка ENV)
-# Дата изменения: 2025-12-30
+# Дата изменения: 2026-01-12
 #
-# Изменения (1.2.1):
-#  - Добавлена переменная WG_EASY_USERNAME (логин для WG-Easy API, по умолчанию 'admin')
-#  - Валидация: username обязателен (не пустой)
+# Изменения (1.2.2):
+#  - Исправлен дефолт WG_EASY_USERNAME: по умолчанию 'admin' (а не 'artem'), устранено противоречие `or "admin"`
+#  - Добавлена строгая валидация DB_PORT как int (при сборке DSN), чтобы исключить мусорные значения
+#  - ADMIN_TELEGRAM_IDS: добавлен дедупликат и защита от отрицательных/нулевых ID
+#  - CORS_ORIGINS: '*' допускается, иначе проверка на пустые элементы
 # ----------------------------------------------------------
 """
 
@@ -109,11 +111,16 @@ class Settings:
         db_dsn = _getenv("BACKEND_DB_DSN")
         if not db_dsn:
             db_host = _require("DB_HOST")
-            db_port = _require("DB_PORT")
+            db_port_int = _getenv_int("DB_PORT")
+            if db_port_int is None:
+                raise RuntimeError("Не задана обязательная переменная окружения: DB_PORT")
+            if db_port_int <= 0:
+                raise RuntimeError("DB_PORT должен быть > 0")
+
             db_name = _require("DB_NAME")
             db_user = _require("DB_USER")
             db_password = _require("DB_PASSWORD")
-            db_dsn = f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+            db_dsn = f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}:{db_port_int}/{db_name}"
 
         # MGMT токен — обязателен
         mgmt_api_token = _require("MGMT_API_TOKEN")
@@ -125,8 +132,9 @@ class Settings:
         # WG-Easy URL: допустим дефолт внутри docker-сети
         wg_easy_url = _getenv("WG_EASY_URL", "http://wg_dashboard:51821") or "http://wg_dashboard:51821"
 
-        # WG-Easy username (ВАЖНО: у тебя 'artem', а не 'admin')
-        wg_easy_username = _getenv("WG_EASY_USERNAME", "artem") or "admin"
+        # WG-Easy username
+        # ВАЖНО: по умолчанию должен быть 'admin' (как в WG-Easy), а не 'artem'
+        wg_easy_username = _getenv("WG_EASY_USERNAME", "admin") or "admin"
         if not wg_easy_username.strip():
             raise RuntimeError("WG_EASY_USERNAME не должен быть пустым.")
 
@@ -137,21 +145,31 @@ class Settings:
 
         wg_easy_password = wg_easy_password_hash or wg_easy_password_plain or ""
         if not wg_easy_password:
-            raise RuntimeError(
-                "Не задан WG_EASY_PASSWORD_HASH или WG_EASY_PASSWORD в окружении backend."
-            )
+            raise RuntimeError("Не задан WG_EASY_PASSWORD_HASH или WG_EASY_PASSWORD в окружении backend.")
 
         # Security placeholders (по ТЗ будут расширяться)
         cors_origins = _split_csv(_getenv("CORS_ORIGINS", "*")) or ["*"]
+        if cors_origins != ["*"]:
+            for origin in cors_origins:
+                if not origin.strip():
+                    raise RuntimeError("CORS_ORIGINS содержит пустое значение.")
+
         admin_ids_raw = _split_csv(_getenv("ADMIN_TELEGRAM_IDS", ""))
-        admin_telegram_ids: List[int] = []
+        admin_telegram_ids_set: set[int] = set()
         for item in admin_ids_raw:
             try:
-                admin_telegram_ids.append(int(item))
-            except ValueError:
+                tid = int(item)
+            except ValueError as exc:
                 raise RuntimeError(
                     f"Некорректное значение ADMIN_TELEGRAM_IDS: {item!r} (ожидаются числа через запятую)"
+                ) from exc
+            if tid <= 0:
+                raise RuntimeError(
+                    f"Некорректное значение ADMIN_TELEGRAM_IDS: {item!r} (ожидаются положительные числа)"
                 )
+            admin_telegram_ids_set.add(tid)
+
+        admin_telegram_ids = sorted(admin_telegram_ids_set)
 
         rate_limit_per_minute = _getenv_int("RATE_LIMIT_PER_MINUTE", 60) or 60
         if rate_limit_per_minute <= 0:

@@ -1,33 +1,22 @@
+"""
 # ----------------------------------------------------------
-# Версия файла: 1.4.6
+# Версия файла: 1.5.1
 # Описание: Backend VPN-проекта (FastAPI + PostgreSQL + WG-Easy v14)
-# Дата изменения: 2025-12-30
+# Дата изменения: 2026-01-12
 #
-# Основное:
-#  - Загрузка конфигурации из переменных окружения
-#  - Подключение к PostgreSQL через SQLAlchemy
-#  - Интеграция с WG-Easy через нативный HTTP-клиент (aiohttp) с корректным JSON
-#  - Эндпоинты:
-#       /health
-#       /api/v1/users/from-telegram
-#       /api/v1/users/{telegram_id}/subscription/active
-#       /api/v1/users/{telegram_id}/trial/activate
-#       /api/v1/subscription-plans/active
-#       /api/v1/vpn/peers/create
-#       /api/v1/vpn/peers/list
-#       /api/v1/vpn/peers/revoke
-#       /api/v1/admin/users
-#       /api/v1/admin/subscription-plans (list/create)
-#
-# Изменения (1.4.6):
-#  - Исправлено получение пароля WG-Easy:
-#      * ранее settings.wg_easy_password мог указывать на bcrypt-хеш (WG_EASY_PASSWORD_HASH),
-#        из-за чего backend логинился хешем и получал 401.
-#      * теперь backend ЯВНО берёт пароль из ENV WG_EASY_PASSWORD (plain), а если его нет —
-#        использует settings.wg_easy_password только если это НЕ bcrypt-хеш.
-#  - Улучшена диагностика: в лог добавляются длины и источник пароля (env/settings),
-#    без вывода самого пароля.
+# Изменения (1.5.1):
+#  - Исправлен wg_probe(): больше НЕ считает 401/403 "ok" (раньше маскировало неверный пароль)
+#  - Исправлена логика продления подписки в _activate_plan_for_user():
+#      * subscription.starts_at теперь = starts_at (а не всегда now)
+#      * продление идёт от max(now, active.ends_at)
+#  - Усилен confirm_stars_payment():
+#      * проверка currency == XTR
+#      * проверка соответствия суммы amount тарифу (если amount передан)
+#      * более безопасная идемпотентность: проверка source для этого платежа
+#  - Удалены/упорядочены импорты, добавлен endpoint /api/v1/admin/subscription-plans/{plan_id} (PATCH) для управления тарифами
+#  - Файл завершён полностью (в твоём фрагменте был обрыв на admin_create_plan)
 # ----------------------------------------------------------
+"""
 
 from __future__ import annotations
 
@@ -44,7 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, contains_eager
 
 from config import get_settings
 from db import db_session, get_db
@@ -71,6 +60,8 @@ WG_DEFAULT_LOCATION_NAME = settings.default_location_name
 
 _DEVICE_SAFE_RE = re.compile(r"[^a-zA-Z0-9_\-\.]+")
 _BCRYPT_RE = re.compile(r"^\$2[aby]\$\d{2}\$.{10,}$")  # "$2b$10$...." и т.п.
+
+STARS_PAYLOAD_PREFIX = "vpn_plan:"
 
 
 def utcnow() -> datetime:
@@ -105,21 +96,43 @@ def _resolve_wg_easy_password() -> tuple[str, str]:
     if cfg_pass and not _looks_like_bcrypt_hash(cfg_pass):
         return cfg_pass, "settings"
 
-    # Если cfg_pass выглядит как bcrypt-хеш — это почти наверняка WG_EASY_PASSWORD_HASH
-    # и использовать его для /api/session нельзя.
     return "", "settings"
+
+
+def _get_admin_max_devices() -> int:
+    """
+    Лимит устройств для админов.
+    По умолчанию: 5. Можно переопределить через ENV ADMIN_MAX_DEVICES.
+    """
+    raw = (os.getenv("ADMIN_MAX_DEVICES") or "").strip()
+    if not raw:
+        return 5
+    try:
+        v = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Некорректное значение ADMIN_MAX_DEVICES: ожидается int, получено {raw!r}") from exc
+    if v <= 0:
+        raise RuntimeError("ADMIN_MAX_DEVICES должен быть > 0")
+    return v
+
+
+DEFAULT_ADMIN_MAX_DEVICES = _get_admin_max_devices()
+
+
+def is_admin_telegram_id(telegram_id: int) -> bool:
+    """
+    Админ определяется по settings.admin_telegram_ids (загружается из ADMIN_TELEGRAM_IDS).
+    """
+    try:
+        return int(telegram_id) in (getattr(settings, "admin_telegram_ids", []) or [])
+    except Exception:
+        return False
 
 
 @dataclass
 class WGEasyHTTP:
     """
     Нативный HTTP-клиент WG-Easy (v14+) через aiohttp.
-    Работает так же, как успешный curl:
-      POST /api/session (JSON: {"password": "..."}), cookie connect.sid
-      POST /api/wireguard/client (JSON: {"name": "..."}), success=true
-      GET  /api/wireguard/client (JSON list)
-      GET  /api/wireguard/client/{id}/configuration (text wireguard config)
-      DELETE /api/wireguard/client/{id} (best-effort)
     """
 
     base_url: str
@@ -178,18 +191,6 @@ class WGEasyHTTP:
         )
         if not isinstance(data, dict) or data.get("success") is not True:
             raise RuntimeError(f"WG-Easy login failed: {data!r}")
-
-    async def session_info(self, session: aiohttp.ClientSession) -> dict:
-        data = await self._request(
-            session,
-            "GET",
-            "/api/session",
-            expected_status=200,
-            return_json=True,
-        )
-        if isinstance(data, dict):
-            return data
-        return {"raw": str(data)}
 
     async def list_clients(self, session: aiohttp.ClientSession) -> list[dict]:
         data = await self._request(
@@ -251,7 +252,10 @@ class WGEasyHTTP:
         except Exception:
             return False
 
-    async def create_and_get_config(self, client_name: str) -> tuple[str, str]:
+    async def create_and_get_config(self, name: str) -> tuple[str, str]:
+        """
+        Создаёт клиента в WG-Easy и возвращает (client_id, config_text).
+        """
         if not self.base():
             raise RuntimeError("WG_EASY_URL пустой")
         if not self.password:
@@ -259,9 +263,9 @@ class WGEasyHTTP:
 
         async with aiohttp.ClientSession(timeout=self._timeout()) as session:
             await self.login(session)
-            await self.create_client(session, client_name)
+            await self.create_client(session, name)
 
-            cid = await self.find_client_id_by_name(session, client_name)
+            cid = await self.find_client_id_by_name(session, name)
             if not cid:
                 raise RuntimeError("WG-Easy: client создан, но id не найден в списке клиентов")
 
@@ -361,6 +365,15 @@ class PeerRevokeRequest(BaseModel):
     location_code: Optional[str] = Field(None, description="Опционально: локация, если нужно уточнить")
 
 
+class PeerConfigResponse(BaseModel):
+    telegram_id: int = Field(..., description="Telegram ID пользователя")
+    client_id: str = Field(..., description="WG-Easy client_id")
+    client_name: str = Field(..., description="Имя клиента (peer) в WG-Easy")
+    location_code: str = Field(..., description="Код локации")
+    location_name: str = Field(..., description="Название локации")
+    config: str = Field(..., description="WireGuard конфигурация (текст .conf)")
+
+
 class SubscriptionPlanCreate(BaseModel):
     code: str = Field(..., description="Уникальный код тарифа")
     name: str = Field(..., description="Название тарифа")
@@ -372,8 +385,32 @@ class SubscriptionPlanCreate(BaseModel):
     max_devices: Optional[int] = Field(None, ge=1, description="Лимит устройств (peers) на тариф")
 
 
+class SubscriptionPlanPatch(BaseModel):
+    name: Optional[str] = None
+    duration_days: Optional[int] = Field(None, ge=1)
+    price_stars: Optional[float] = Field(None, ge=0)
+    is_trial: Optional[bool] = None
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
+    max_devices: Optional[int] = Field(None, ge=1)
+
+
 class PlansPublicResponse(BaseModel):
     plans: list[SubscriptionPlanOut] = Field(..., description="Список активных тарифов")
+
+
+class StarsConfirmRequest(BaseModel):
+    telegram_id: int = Field(..., description="Telegram ID пользователя")
+    invoice_payload: str = Field(..., description="Payload, который пришёл в successful_payment")
+    currency: str = Field(..., description="Валюта (ожидается XTR)")
+    amount: Optional[int] = Field(None, description="Сумма (в Stars, как пришло от Telegram)")
+    telegram_payment_charge_id: str = Field(..., description="ID списания Telegram")
+    provider_payment_charge_id: Optional[str] = Field(None, description="ID провайдера (может быть пустым)")
+
+
+class StarsConfirmResponse(BaseModel):
+    success: bool
+    message: str
 
 
 # -----------------------------
@@ -469,20 +506,22 @@ def get_or_create_user(db: Session, payload: TelegramUserIn) -> tuple[User, bool
 
 
 def get_active_subscription(db: Session, user_id: int) -> Optional[Subscription]:
+    """
+    Важно: подгружаем plan через join, чтобы не словить lazy-loading вне активной сессии.
+    """
     now = utcnow()
-    return (
-        db.execute(
-            select(Subscription)
-            .where(
-                Subscription.user_id == user_id,
-                Subscription.is_active.is_(True),
-                Subscription.ends_at >= now,
-            )
-            .order_by(Subscription.ends_at.desc())
+    q = (
+        select(Subscription)
+        .join(SubscriptionPlan, Subscription.plan_id == SubscriptionPlan.id, isouter=True)
+        .options(contains_eager(Subscription.plan))
+        .where(
+            Subscription.user_id == user_id,
+            Subscription.is_active.is_(True),
+            Subscription.ends_at >= now,
         )
-        .scalars()
-        .first()
+        .order_by(Subscription.ends_at.desc())
     )
+    return db.execute(q).scalars().first()
 
 
 def has_had_trial(db: Session, user_id: int) -> bool:
@@ -522,7 +561,102 @@ def get_or_create_trial_plan(db: Session) -> SubscriptionPlan:
     return plan
 
 
-def build_subscription_status(db: Session, user: User) -> SubscriptionStatusResponse:
+def ensure_default_plans(db: Session) -> None:
+    """
+    Создаёт/обновляет базовые тарифы при старте.
+    Требование: безлимит устройств -> max_devices=None.
+    """
+    desired = [
+        {
+            "code": "trial_10",
+            "name": "Бесплатный триал на 10 дней",
+            "duration_days": 10,
+            "price_stars": 0,
+            "is_trial": True,
+            "is_active": True,
+            "sort_order": 0,
+            "max_devices": None,
+        },
+        {
+            "code": "m1_69",
+            "name": "1 месяц",
+            "duration_days": 30,
+            "price_stars": 69,
+            "is_trial": False,
+            "is_active": True,
+            "sort_order": 10,
+            "max_devices": None,
+        },
+        {
+            "code": "m2_119",
+            "name": "2 месяца",
+            "duration_days": 60,
+            "price_stars": 119,
+            "is_trial": False,
+            "is_active": True,
+            "sort_order": 20,
+            "max_devices": None,
+        },
+        {
+            "code": "m3_159",
+            "name": "3 месяца",
+            "duration_days": 90,
+            "price_stars": 159,
+            "is_trial": False,
+            "is_active": True,
+            "sort_order": 30,
+            "max_devices": None,
+        },
+    ]
+
+    created = 0
+    updated = 0
+
+    for d in desired:
+        plan = db.execute(select(SubscriptionPlan).where(SubscriptionPlan.code == d["code"])).scalar_one_or_none()
+        if not plan:
+            plan = SubscriptionPlan(
+                code=d["code"],
+                name=d["name"],
+                duration_days=d["duration_days"],
+                price_stars=d["price_stars"],
+                is_trial=d["is_trial"],
+                is_active=d["is_active"],
+                sort_order=d["sort_order"],
+                max_devices=d["max_devices"],
+            )
+            db.add(plan)
+            created += 1
+            continue
+
+        changed = False
+        for field in ("name", "duration_days", "price_stars", "is_trial", "is_active", "sort_order", "max_devices"):
+            if getattr(plan, field) != d[field]:
+                setattr(plan, field, d[field])
+                changed = True
+
+        if changed:
+            db.add(plan)
+            updated += 1
+
+    if created or updated:
+        db.commit()
+
+    logger.info("plans seed: created=%s updated=%s", created, updated)
+
+
+def build_subscription_status(db: Session, user: User, *, telegram_id: Optional[int] = None) -> SubscriptionStatusResponse:
+    tid = telegram_id if telegram_id is not None else int(getattr(user, "telegram_id", 0) or 0)
+    if tid and is_admin_telegram_id(tid):
+        logger.info("subscription/active: admin access telegram_id=%s -> has_active_subscription=True", tid)
+        return SubscriptionStatusResponse(
+            has_active_subscription=True,
+            is_trial_active=False,
+            active_plan_name="ADMIN",
+            subscription_ends_at=None,
+            trial_available=False,
+        )
+
     active = get_active_subscription(db, user.id)
     trial_used = has_had_trial(db, user.id)
 
@@ -545,7 +679,10 @@ def build_subscription_status(db: Session, user: User) -> SubscriptionStatusResp
     )
 
 
-def require_active_subscription(db: Session, user: User) -> Subscription:
+def require_active_subscription_or_admin(db: Session, user: User, telegram_id: int) -> tuple[Optional[Subscription], bool]:
+    if is_admin_telegram_id(telegram_id):
+        return None, True
+
     sub = get_active_subscription(db, user.id)
     if not sub:
         raise HTTPException(
@@ -557,27 +694,24 @@ def require_active_subscription(db: Session, user: User) -> Subscription:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Тарифный план отключён. Обратитесь в поддержку.",
         )
-    return sub
+    return sub, False
 
 
-def enforce_device_limit(db: Session, user: User, location_code: str, sub: Subscription) -> None:
-    max_devices = None
-    if sub.plan and sub.plan.max_devices:
-        max_devices = sub.plan.max_devices
+def enforce_device_limit(db: Session, user: User, location_code: str, sub: Optional[Subscription], *, is_admin: bool) -> None:
+    """
+    Ограничиваем кол-во активных peers.
+    Особенность: если у пользователя уже есть активный peer в данной локации — не создаём второй, а выдаём существующий.
+    Поэтому лимит проверяем только если в локации ещё нет активного peer.
+    """
+    if is_admin:
+        max_devices = DEFAULT_ADMIN_MAX_DEVICES
+    else:
+        max_devices = None
+        if sub and sub.plan and sub.plan.max_devices:
+            max_devices = sub.plan.max_devices
 
     if not max_devices:
         return
-
-    active_peers_count = (
-        db.execute(
-            select(func.count(VpnPeer.id)).where(
-                VpnPeer.user_id == user.id,
-                VpnPeer.is_active.is_(True),
-            )
-        )
-        .scalar_one()
-        or 0
-    )
 
     existing_peer_in_location = (
         db.execute(
@@ -595,22 +729,35 @@ def enforce_device_limit(db: Session, user: User, location_code: str, sub: Subsc
     if existing_peer_in_location:
         return
 
+    active_peers_count = (
+        db.execute(
+            select(func.count(VpnPeer.id)).where(
+                VpnPeer.user_id == user.id,
+                VpnPeer.is_active.is_(True),
+            )
+        )
+        .scalar_one()
+        or 0
+    )
+
     if active_peers_count >= max_devices:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Достигнут лимит устройств по тарифу: {max_devices}. Отключите лишнее устройство.",
+            detail=f"Достигнут лимит устройств: {max_devices}. Отключите лишнее устройство.",
         )
 
 
 async def wg_probe() -> Tuple[bool, Optional[str]]:
+    """
+    Проверка доступности WG-Easy:
+      - ok только если успешный login (HTTP 200 + success=true)
+      - любые 401/403/4xx считаем ошибкой, чтобы НЕ маскировать неверный пароль/доступ
+    """
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5.0)) as session:
-            _ = await wg_client.session_info(session)
+            await wg_client.login(session)
             return True, None
     except aiohttp.ClientResponseError as exc:
-        code = int(getattr(exc, "status", 0) or 0)
-        if 200 <= code < 500:
-            return True, None
         return False, f"wg-easy error: {_summarize_wg_error(exc)}"
     except Exception as exc:
         return False, f"wg-easy probe failed: {exc!r}"
@@ -641,7 +788,7 @@ def require_mgmt_token(api_key: str = Depends(mgmt_api_header)) -> str:
 app = FastAPI(
     title="VPN Service Backend",
     description="Backend-сервис для Telegram VPN-бота с интеграцией WG-Easy (v14)",
-    version="1.4.6",
+    version="1.5.1",
 )
 
 cors_origins = getattr(settings, "cors_origins", None) or ["*"]
@@ -660,7 +807,8 @@ def on_startup() -> None:
     try:
         with db_session() as session:
             session.execute(text("SELECT 1"))
-        logger.info("vpn-backend: Подключение к БД успешно, backend готов к работе.")
+            ensure_default_plans(session)
+        logger.info("vpn-backend: Подключение к БД успешно, тарифы проверены/созданы, backend готов к работе.")
     except Exception as exc:
         logger.error("vpn-backend: Ошибка подключения к БД при старте: %s", exc, exc_info=True)
         raise
@@ -707,7 +855,7 @@ def register_user_from_telegram(
     db: Session = Depends(get_db),
 ) -> UserFromTelegramResponse:
     user, is_new = get_or_create_user(db, payload)
-    status_data = build_subscription_status(db, user)
+    status_data = build_subscription_status(db, user, telegram_id=payload.telegram_id)
 
     return UserFromTelegramResponse(
         user=UserOut.model_validate(user),
@@ -734,7 +882,7 @@ def get_subscription_status(
     user = db.execute(select(User).where(User.telegram_id == telegram_id)).scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пользователь не найден")
-    return build_subscription_status(db, user)
+    return build_subscription_status(db, user, telegram_id=telegram_id)
 
 
 @app.post(
@@ -749,6 +897,16 @@ def activate_trial(
     user = db.execute(select(User).where(User.telegram_id == telegram_id)).scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пользователь не найден")
+
+    if is_admin_telegram_id(telegram_id):
+        return TrialGrantResponse(
+            success=False,
+            message="Для администратора триал не требуется (доступ активен всегда).",
+            trial_ends_at=None,
+            user=UserOut.model_validate(user),
+            plan=None,
+            already_had_trial=True,
+        )
 
     if has_had_trial(db, user.id):
         return TrialGrantResponse(
@@ -839,12 +997,12 @@ async def create_vpn_peer(
         ),
     )
 
-    active_sub = require_active_subscription(db, user)
+    sub, is_admin = require_active_subscription_or_admin(db, user, payload.telegram_id)
 
     location_code = payload.location_code or WG_DEFAULT_LOCATION_CODE
     location_name = payload.location_name or WG_DEFAULT_LOCATION_NAME
 
-    enforce_device_limit(db, user, location_code, active_sub)
+    enforce_device_limit(db, user, location_code, sub, is_admin=is_admin)
 
     existing_peer = (
         db.execute(
@@ -876,13 +1034,12 @@ async def create_vpn_peer(
         raw_name = payload.device_name or fallback_name
         client_name = normalize_client_name(raw_name, fallback=fallback_name)
 
-        # Делаем имя уникальным для корректного поиска id по имени
         unique_suffix = int(utcnow().timestamp())
         if len(client_name) > 40:
             client_name = client_name[:40]
         client_name = f"{client_name}_{unique_suffix}"
 
-        wg_client_id, config_text = await wg_client.create_and_get_config(client_name=client_name)
+        wg_client_id, config_text = await wg_client.create_and_get_config(name=client_name)
         config_text = str(config_text or "")
 
         peer = VpnPeer(
@@ -897,6 +1054,14 @@ async def create_vpn_peer(
         db.commit()
         db.refresh(peer)
 
+        logger.info(
+            "peers/create: created peer telegram_id=%s admin=%s location=%s wg_client_id=%s",
+            payload.telegram_id,
+            is_admin,
+            location_code,
+            peer.wg_client_id,
+        )
+
         return PeerCreateResponse(
             client_id=peer.wg_client_id,
             client_name=peer.client_name,
@@ -909,7 +1074,6 @@ async def create_vpn_peer(
         raise
     except Exception as exc:
         logger.error("Ошибка при работе с WG-Easy: %s", _summarize_wg_error(exc), exc_info=True)
-
         hint = (
             "WG-Easy вернул ошибку. Возможные причины: неверный пароль для API (нужен WG_EASY_PASSWORD, не hash), "
             "исчерпан пул IP адресов (например /24 ≈ 253 клиента), либо проблема в данных WG-Easy (volume /etc/wireguard). "
@@ -1003,6 +1167,182 @@ async def revoke_vpn_peer(
     return {"ok": True, "message": "Peer деактивирован"}
 
 
+@app.get(
+    "/api/v1/vpn/peers/config",
+    response_model=PeerConfigResponse,
+    summary="Получить WireGuard конфиг для конкретного peer по telegram_id + client_id",
+)
+async def get_peer_config(
+    telegram_id: int,
+    client_id: str,
+    db: Session = Depends(get_db),
+) -> PeerConfigResponse:
+    user = db.execute(select(User).where(User.telegram_id == telegram_id)).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пользователь не найден")
+
+    peer = (
+        db.execute(
+            select(VpnPeer).where(
+                VpnPeer.user_id == user.id,
+                VpnPeer.wg_client_id == client_id,
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if not peer:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Peer не найден")
+
+    try:
+        cfg = await wg_client.get_config(peer.wg_client_id)
+        cfg = str(cfg or "")
+        if not cfg.strip():
+            raise RuntimeError("WG-Easy вернул пустой конфиг для peer")
+    except Exception as exc:
+        logger.error("peers/config: ошибка получения конфига: %s", _summarize_wg_error(exc), exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Не удалось получить конфигурацию из WG-Easy. Проверь логи wg_dashboard.",
+        ) from exc
+
+    return PeerConfigResponse(
+        telegram_id=telegram_id,
+        client_id=peer.wg_client_id,
+        client_name=peer.client_name,
+        location_code=peer.location_code,
+        location_name=peer.location_name,
+        config=cfg,
+    )
+
+
+# -----------------------------
+# Payments (Stars)
+# -----------------------------
+
+def _parse_stars_payload(payload: str) -> Tuple[str, int]:
+    """
+    Ожидаем формат: vpn_plan:<plan_code>:<telegram_id>:<ts>
+    Возвращаем: (plan_code, telegram_id).
+    """
+    raw = (payload or "").strip()
+    if not raw.startswith(STARS_PAYLOAD_PREFIX):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Некорректный payload (prefix)")
+    rest = raw[len(STARS_PAYLOAD_PREFIX):]
+    parts = rest.split(":")
+    if len(parts) < 2:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Некорректный payload (parts)")
+    plan_code = parts[0].strip()
+    if not plan_code:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Некорректный payload (plan_code)")
+    try:
+        telegram_id = int(parts[1])
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Некорректный payload (telegram_id)")
+    return plan_code, telegram_id
+
+
+def _activate_plan_for_user(db: Session, user: User, plan: SubscriptionPlan, *, source: str) -> Subscription:
+    """
+    Создаёт/продлевает подписку. Если есть активная — продлевает от max(now, ends_at).
+    """
+    now = utcnow()
+
+    active = get_active_subscription(db, user.id)
+    starts_at = now
+    if active and active.ends_at and active.ends_at > now:
+        starts_at = active.ends_at
+
+    ends_at = starts_at + timedelta(days=int(plan.duration_days))
+
+    subscription = Subscription(
+        user_id=user.id,
+        plan_id=plan.id,
+        server_id=None,
+        starts_at=starts_at,
+        ends_at=ends_at,
+        is_active=True,
+        is_trial=bool(plan.is_trial),
+        source=source,
+    )
+    db.add(subscription)
+    db.commit()
+    db.refresh(subscription)
+    return subscription
+
+
+@app.post(
+    "/api/v1/payments/stars/confirm",
+    response_model=StarsConfirmResponse,
+    summary="Подтверждение оплаты Stars (для бота)",
+)
+def confirm_stars_payment(
+    payload: StarsConfirmRequest,
+    db: Session = Depends(get_db),
+) -> StarsConfirmResponse:
+    """
+    Идемпотентность в идеале делается через таблицу платежей.
+    Здесь (черновой) вариант:
+      - если уже есть Subscription с source='stars:<telegram_payment_charge_id>' — считаем подтверждённым
+      - иначе активируем план по plan_code из invoice_payload
+    """
+    if (payload.currency or "").strip().upper() != "XTR":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Некорректная валюта (ожидается XTR)")
+
+    plan_code, telegram_id_from_payload = _parse_stars_payload(payload.invoice_payload)
+    if telegram_id_from_payload != int(payload.telegram_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="payload.telegram_id не совпадает с invoice_payload",
+        )
+
+    user = db.execute(select(User).where(User.telegram_id == payload.telegram_id)).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пользователь не найден")
+
+    plan = (
+        db.execute(
+            select(SubscriptionPlan).where(
+                SubscriptionPlan.code == plan_code,
+                SubscriptionPlan.is_active.is_(True),
+            )
+        )
+        .scalar_one_or_none()
+    )
+    if not plan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Тариф не найден или отключён")
+
+    # Если Telegram прислал amount — сверяем с тарифом (в Stars).
+    # price_stars хранится float, но тарифы у нас целочисленные Stars -> приводим к int.
+    if payload.amount is not None:
+        try:
+            expected = int(float(plan.price_stars))
+        except Exception:
+            expected = None
+        if expected is not None and expected > 0 and int(payload.amount) != expected:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Некорректная сумма: ожидалось {expected} Stars, получено {payload.amount}",
+            )
+
+    source = f"stars:{payload.telegram_payment_charge_id}"
+
+    already = (
+        db.execute(
+            select(Subscription).where(
+                Subscription.user_id == user.id,
+                Subscription.source == source,
+            )
+        )
+        .scalar_one_or_none()
+    )
+    if already:
+        return StarsConfirmResponse(success=True, message="Платёж уже подтверждён ранее. Подписка активна.")
+
+    _ = _activate_plan_for_user(db, user, plan, source=source)
+    return StarsConfirmResponse(success=True, message="Подписка активирована.")
+
+
 # -----------------------------
 # Admin API
 # -----------------------------
@@ -1064,3 +1404,58 @@ def admin_create_plan(
     db.commit()
     db.refresh(plan)
     return SubscriptionPlanOut.model_validate(plan)
+
+
+@app.patch(
+    "/api/v1/admin/subscription-plans/{plan_id}",
+    response_model=SubscriptionPlanOut,
+    summary="Обновить тариф (admin)",
+    tags=["admin"],
+)
+def admin_patch_plan(
+    plan_id: int,
+    payload: SubscriptionPlanPatch,
+    _token: str = Depends(require_mgmt_token),
+    db: Session = Depends(get_db),
+) -> SubscriptionPlanOut:
+    plan = db.execute(select(SubscriptionPlan).where(SubscriptionPlan.id == plan_id)).scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Тариф не найден")
+
+    changed = False
+    for field in ("name", "duration_days", "price_stars", "is_trial", "is_active", "sort_order", "max_devices"):
+        val = getattr(payload, field)
+        if val is None:
+            continue
+        if getattr(plan, field) != val:
+            setattr(plan, field, val)
+            changed = True
+
+    if changed:
+        db.add(plan)
+        db.commit()
+        db.refresh(plan)
+
+    return SubscriptionPlanOut.model_validate(plan)
+
+
+@app.get(
+    "/api/v1/admin/health/wg-easy",
+    summary="Проверка WG-Easy (admin)",
+    tags=["admin"],
+)
+async def admin_wg_easy_check(
+    _token: str = Depends(require_mgmt_token),
+) -> dict:
+    ok, details = await wg_probe()
+    return {"ok": ok, "details": details, "wg_easy_url": settings.wg_easy_url}
+
+
+# -----------------------------
+# Optional: Uvicorn entrypoint (если запускаешь python app_main.py)
+# -----------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app_main:app", host="0.0.0.0", port=8000, reload=False)

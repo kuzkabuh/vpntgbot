@@ -1,6 +1,6 @@
 """
 # ----------------------------------------------------------
-# Версия файла: 1.3.1
+# Версия файла: 1.4.9
 # Описание: ORM-модели SQLAlchemy для VPN backend
 #  - Location: локации (страны/регионы)
 #  - Server: VPN-сервера (WireGuard-ноды)
@@ -8,11 +8,14 @@
 #  - SubscriptionPlan: тарифные планы
 #  - Subscription: подписки пользователей
 #  - VpnPeer: WireGuard-пиры (интеграция с WG-Easy)
-# Дата изменения: 2025-12-30
+#  - Payment: платежи (Telegram Stars)  <-- ДОБАВЛЕНО
+# Дата изменения: 2026-01-12
 #
-# Изменения (1.3.1):
-#  - Файл приведён к целостному виду (без изменений бизнес-логики)
-#  - Оставлены индексы/ограничения, важные для производительности и целостности
+# Изменения (1.4.9):
+#  - Добавлена модель Payment для учёта оплат Telegram Stars
+#  - Добавлены индексы и уникальность по telegram_payment_charge_id (идемпотентность)
+#  - Убраны неиспользуемые импорты (List/Optional оставлены как используются)
+#  - Бизнес-логика не менялась, только расширение схемы под платежи
 # ----------------------------------------------------------
 """
 
@@ -173,6 +176,14 @@ class User(Base):
         cascade="all, delete-orphan",
     )
 
+    # Платежи пользователя (история оплат)
+    payments: Mapped[List["Payment"]] = relationship(
+        "Payment",
+        back_populates="user",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+    )
+
     __table_args__ = (
         Index("ix_users_is_admin", "is_admin"),
         Index("ix_users_is_blocked", "is_blocked"),
@@ -216,6 +227,12 @@ class SubscriptionPlan(Base):
 
     subscriptions: Mapped[List["Subscription"]] = relationship(
         "Subscription",
+        back_populates="plan",
+        lazy="selectin",
+    )
+
+    payments: Mapped[List["Payment"]] = relationship(
+        "Payment",
         back_populates="plan",
         lazy="selectin",
     )
@@ -275,6 +292,12 @@ class Subscription(Base):
     plan: Mapped[SubscriptionPlan] = relationship("SubscriptionPlan", back_populates="subscriptions", lazy="selectin")
     server: Mapped[Optional[Server]] = relationship("Server", back_populates="subscriptions", lazy="selectin")
 
+    payments: Mapped[List["Payment"]] = relationship(
+        "Payment",
+        back_populates="subscription",
+        lazy="selectin",
+    )
+
     __table_args__ = (
         Index("ix_subscriptions_user_active", "user_id", "is_active"),
         Index("ix_subscriptions_active_ends", "is_active", "ends_at"),
@@ -282,6 +305,66 @@ class Subscription(Base):
 
     def __repr__(self) -> str:
         return f"<Subscription user_id={self.user_id} plan_id={self.plan_id} active={self.is_active}>"
+
+
+# ======================
+# ПЛАТЕЖИ (TELEGRAM STARS)
+# ======================
+
+
+class Payment(Base):
+    """
+    Факт платежа (Telegram Stars).
+    Идемпотентность: telegram_payment_charge_id уникален.
+    """
+
+    __tablename__ = "payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    provider: Mapped[str] = mapped_column(String(32), default="telegram_stars", nullable=False)
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    telegram_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+
+    plan_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("subscription_plans.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    subscription_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("subscriptions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    currency: Mapped[str] = mapped_column(String(8), nullable=False)
+    amount: Mapped[Numeric] = mapped_column(Numeric(10, 2), nullable=False)
+
+    invoice_payload: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    telegram_payment_charge_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    provider_payment_charge_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    status: Mapped[str] = mapped_column(String(16), default="paid", nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    user: Mapped[User] = relationship("User", back_populates="payments", lazy="selectin")
+    plan: Mapped[Optional[SubscriptionPlan]] = relationship("SubscriptionPlan", back_populates="payments", lazy="selectin")
+    subscription: Mapped[Optional[Subscription]] = relationship("Subscription", back_populates="payments", lazy="selectin")
+
+    __table_args__ = (
+        Index("ix_payments_created_at", "created_at"),
+        Index("ix_payments_status_created", "status", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Payment id={self.id} tg_id={self.telegram_id} amount={self.amount} {self.currency}>"
 
 
 # ======================

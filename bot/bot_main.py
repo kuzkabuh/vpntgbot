@@ -1,30 +1,38 @@
+"""
 # ----------------------------------------------------------
-# Версия файла: 1.7.1
-# Описание: Telegram-бот для VPN-сервиса (статус подписки, активация триала,
-#           меню тарифов, выдача WireGuard-конфига, управление устройствами)
-# Дата изменения: 2025-12-30
-# Изменения (1.7.1):
-#  - Исправлен баг в _PLAN_MAP: при token-ветке искался ключ token, но план сохранялся по code.
-#    Теперь для plan_buy_t:* корректно восстанавливаем plan/code.
-#  - Добавлено закрытие HTTP-клиента через dp.shutdown.register с сигнатурой (dispatcher),
-#    чтобы корректно работать в aiogram v3 (и не упасть при вызове shutdown callbacks).
-#  - Добавлена нормализация и очистка in-memory карт (ограничение размера) для защиты от разрастания памяти.
-#  - Улучшены сообщения об ошибках/логирование; добавлен validate BACKEND_BASE_URL.
-#  - Устранены потенциальные проблемы: использование HTML escape в сообщениях, безопасные pre-блоки,
-#    защита от пустых/невалидных данных.
+# Версия файла: 1.8.0
+# Описание: Telegram-бот для VPN-сервиса (тарифы/триал, управление WireGuard-устройствами,
+#          повторная выдача конфигов, выдача QR-кода, инструкция подключения,
+#          подготовка Stars оплаты + админ-панель платежей/подписок)
+# Дата изменения: 2026-01-12
+#
+# Изменения (1.8.0):
+#  - Добавлено админ-меню "🛡 Админ: Платежи/подписки" (видно только ADMIN_TELEGRAM_IDS)
+#  - Добавлены админ-кнопки:
+#      * "🧾 Планы (backend)" — список активных тарифов
+#      * "🔎 Проверить подписку (TG ID)" — проверка статуса пользователя по Telegram ID
+#      * "✅ Подтвердить Stars оплату (payload)" — ручное подтверждение платежа (backend /payments/stars/confirm)
+#      * "🕘 Последний платёж" — показывает данные последнего successful_payment в боте
+#  - Добавлен FSM-like ввод (через ожидание текста) для админ-действий
+#  - Сохранение последнего платежа (in-memory) для быстрого админ-подтверждения
 # ----------------------------------------------------------
+"""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import html
+import io
 import logging
 import os
 import re
-from typing import Any, Optional
+import time
+from dataclasses import dataclass
+from typing import Any, Optional, Tuple
 
 import httpx
+import qrcode
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart
@@ -33,9 +41,11 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
     ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 
 # ------------------------------------------------------
@@ -54,24 +64,40 @@ logger = logging.getLogger("vpn-bot")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-# В docker compose сервис обычно называется "backend"
+# В docker compose сервис называется "backend"
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://backend:8000").strip()
-
 BACKEND_TIMEOUT = float(os.getenv("BACKEND_TIMEOUT", "12.0"))
 BACKEND_CONNECT_TIMEOUT = float(os.getenv("BACKEND_CONNECT_TIMEOUT", "3.5"))
 
-# Telegram limits
-TG_MSG_LIMIT = 4096
-TG_CALLBACK_LIMIT = 64
+# Лимит конфигов на пользователя:
+#  - если 0 или меньше -> безлимит
+MAX_CONFIGS_PER_USER = int(os.getenv("MAX_CONFIGS_PER_USER", "0"))
 
-# Пределы на in-memory мапы (защита от утечки памяти при большом количестве действий)
-MAX_TOKEN_MAP_PER_USER = int(os.getenv("MAX_TOKEN_MAP_PER_USER", "200"))
+# TTL для callback-токенов
+_CALLBACK_TTL_SEC = int(os.getenv("CALLBACK_TOKEN_TTL_SEC", "3600"))  # 1 час
+
+# Параметры Stars оплаты
+STARS_ENABLED = os.getenv("STARS_ENABLED", "1").strip() == "1"
+STARS_CURRENCY = "XTR"  # Telegram Stars currency
+STARS_PROVIDER_TOKEN = ""  # для Stars provider_token оставляют пустым
+STARS_PAYLOAD_PREFIX = "vpn_plan:"
+STARS_START_PARAMETER_PREFIX = "vpn_plan"
+
+# Админы
+ADMIN_TELEGRAM_IDS_RAW = (os.getenv("ADMIN_TELEGRAM_IDS") or "").strip()
+ADMIN_TELEGRAM_IDS: set[int] = set()
+if ADMIN_TELEGRAM_IDS_RAW:
+    for part in ADMIN_TELEGRAM_IDS_RAW.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            ADMIN_TELEGRAM_IDS.add(int(p))
+        except Exception:
+            continue
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в окружении бота.")
-
-if not BACKEND_BASE_URL.startswith(("http://", "https://")):
-    raise RuntimeError("BACKEND_BASE_URL должен начинаться с http:// или https://")
 
 # ------------------------------------------------------
 # Инициализация бота и диспетчера (aiogram v3.x)
@@ -84,105 +110,128 @@ bot = Bot(
 dp = Dispatcher()
 
 # ------------------------------------------------------
-# Runtime storage (in-memory)
-# ------------------------------------------------------
-# Маппинг токенов callback -> client_id, чтобы не превышать лимит callback_data
-# Формат: {telegram_id: {token: client_id}}
-_REVOKE_TOKEN_MAP: dict[int, dict[str, str]] = {}
-
-# Маппинг тарифов (key -> plan_dict) для пользователя.
-# Ключом может быть как code, так и token (для plan_buy_t).
-# Формат: {telegram_id: {key: plan_dict}}
-_PLAN_MAP: dict[int, dict[str, dict[str, Any]]] = {}
-
-# ------------------------------------------------------
-# HTTP client (reused)
+# Простое состояние ввода (без FSM-хранилища)
 # ------------------------------------------------------
 
-_http_client: Optional[httpx.AsyncClient] = None
+@dataclass
+class PendingInput:
+    action: str
+    created_ts: float
 
 
-def _get_http_timeout(timeout: Optional[float] = None) -> httpx.Timeout:
-    return httpx.Timeout(timeout or BACKEND_TIMEOUT, connect=BACKEND_CONNECT_TIMEOUT)
+_pending_lock = asyncio.Lock()
+_pending_by_user: dict[int, PendingInput] = {}
+_PENDING_TTL = 600  # 10 минут
 
 
-async def _ensure_http_client() -> httpx.AsyncClient:
-    global _http_client
-    if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=_get_http_timeout())
-    return _http_client
+async def set_pending(user_id: int, action: str) -> None:
+    async with _pending_lock:
+        _pending_by_user[user_id] = PendingInput(action=action, created_ts=time.time())
 
 
-async def _close_http_client() -> None:
-    global _http_client
-    if _http_client is not None:
-        await _http_client.aclose()
-        _http_client = None
+async def pop_pending(user_id: int) -> Optional[PendingInput]:
+    now = time.time()
+    async with _pending_lock:
+        pi = _pending_by_user.get(user_id)
+        if not pi:
+            return None
+        if now - pi.created_ts > _PENDING_TTL:
+            _pending_by_user.pop(user_id, None)
+            return None
+        _pending_by_user.pop(user_id, None)
+        return pi
+
+
+async def peek_pending(user_id: int) -> Optional[PendingInput]:
+    now = time.time()
+    async with _pending_lock:
+        pi = _pending_by_user.get(user_id)
+        if not pi:
+            return None
+        if now - pi.created_ts > _PENDING_TTL:
+            _pending_by_user.pop(user_id, None)
+            return None
+        return pi
+
+
+def is_admin(user_id: int) -> bool:
+    return int(user_id) in ADMIN_TELEGRAM_IDS
+
+
+# ------------------------------------------------------
+# Безопасные callback токены (не храним client_id в callback_data напрямую)
+# ------------------------------------------------------
+
+_callback_lock = asyncio.Lock()
+_callback_map: dict[str, Tuple[str, float]] = {}  # token -> (client_id, created_ts)
+
+
+def _cleanup_callback_map(now: float) -> None:
+    to_del = [k for k, (_, ts) in _callback_map.items() if now - ts > _CALLBACK_TTL_SEC]
+    for k in to_del:
+        _callback_map.pop(k, None)
+
+
+async def register_client_id_for_callback(client_id: str) -> str:
+    now = time.time()
+    base = f"{client_id}|{now}".encode("utf-8", errors="replace")
+    token = hashlib.sha256(base).hexdigest()[:16]
+    async with _callback_lock:
+        _cleanup_callback_map(now)
+        _callback_map[token] = (client_id, now)
+    return token
+
+
+async def resolve_client_id_from_callback(token: str) -> Optional[str]:
+    now = time.time()
+    async with _callback_lock:
+        _cleanup_callback_map(now)
+        item = _callback_map.get(token)
+        if not item:
+            return None
+        client_id, ts = item
+        if now - ts > _CALLBACK_TTL_SEC:
+            _callback_map.pop(token, None)
+            return None
+        return client_id
 
 
 # ------------------------------------------------------
 # UI: клавиатуры
 # ------------------------------------------------------
 
-def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    """Главное меню бота."""
+def main_menu_keyboard(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
     keyboard = [
-        [KeyboardButton(text="📊 Мой тариф и статус VPN")],
-        [KeyboardButton(text="💳 Тарифы и оплата")],
-        [KeyboardButton(text="🎁 Активировать бесплатный период")],
-        [KeyboardButton(text="🔐 Получить конфиг WireGuard")],
-        [KeyboardButton(text="📱 Мои устройства")],
+        [KeyboardButton(text="📊 Статус подписки"), KeyboardButton(text="🎁 Активировать триал")],
+        [KeyboardButton(text="🔐 Конфиги WireGuard"), KeyboardButton(text="📱 Устройства")],
+        [KeyboardButton(text="📖 Инструкция подключения"), KeyboardButton(text="⭐ Купить подписку")],
         [KeyboardButton(text="ℹ️ О проекте")],
     ]
-    return ReplyKeyboardMarkup(
-        keyboard=keyboard,
-        resize_keyboard=True,
-    )
+
+    if user_id is not None and is_admin(user_id):
+        keyboard.append([KeyboardButton(text="🛡 Админ: Платежи/подписки")])
+
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
-def _trim_user_map(user_map: dict[str, Any]) -> None:
-    """
-    Ограничивает размер пользовательского словаря (на случай, если пользователь кликает бесконечно).
-    Простая стратегия: если больше MAX_TOKEN_MAP_PER_USER — удаляем самые "старые" элементы по порядку вставки.
-    (В Python 3.7+ dict сохраняет порядок вставки.)
-    """
-    if MAX_TOKEN_MAP_PER_USER <= 0:
-        return
-    while len(user_map) > MAX_TOKEN_MAP_PER_USER:
-        try:
-            first_key = next(iter(user_map.keys()))
-            user_map.pop(first_key, None)
-        except StopIteration:
-            break
+def admin_payments_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton(text="🧾 Планы (backend)"), KeyboardButton(text="🔎 Проверить подписку (TG ID)")],
+        [KeyboardButton(text="✅ Подтвердить Stars оплату (payload)"), KeyboardButton(text="🕘 Последний платёж")],
+        [KeyboardButton(text="⬅️ Назад в меню")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
-def _make_revoke_callback_data(telegram_id: int, client_id: str) -> str:
-    """
-    Генерирует callback_data для revoke с учетом лимита Telegram (64 байта).
-    Если client_id не влезает — заменяем на токен и сохраняем в памяти.
-    """
-    raw = f"revoke:{client_id}"
-    if len(raw.encode("utf-8")) <= TG_CALLBACK_LIMIT:
-        return raw
-
-    token = hashlib.sha1(client_id.encode("utf-8", errors="ignore")).hexdigest()[:12]
-    user_map = _REVOKE_TOKEN_MAP.setdefault(telegram_id, {})
-    user_map[token] = client_id
-    _trim_user_map(user_map)
-    return f"revoke_t:{token}"
+def _is_unlimited() -> bool:
+    return MAX_CONFIGS_PER_USER <= 0
 
 
-def devices_inline_keyboard(telegram_id: int, peers: list[dict[str, Any]]) -> InlineKeyboardMarkup:
-    """
-    Инлайн-клавиатура для управления устройствами.
-    Для каждого активного пира — кнопка «Отключить».
-    """
+def devices_inline_keyboard(peers: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-
     for p in peers:
         if not p.get("is_active", True):
             continue
-
         client_id = str(p.get("client_id", "")).strip()
         client_name = str(p.get("client_name", "")).strip() or "device"
         location_code = str(p.get("location_code", "")).strip()
@@ -193,67 +242,88 @@ def devices_inline_keyboard(telegram_id: int, peers: list[dict[str, Any]]) -> In
         btn_text = f"🗑 Отключить: {client_name}"
         if location_code:
             btn_text += f" ({location_code})"
-
-        cb_data = _make_revoke_callback_data(telegram_id=telegram_id, client_id=client_id)
-        rows.append([InlineKeyboardButton(text=btn_text, callback_data=cb_data)])
+        rows.append([InlineKeyboardButton(text=btn_text, callback_data=f"revoke:{client_id}")])
 
     if not rows:
-        rows = [[InlineKeyboardButton(text="Обновить список", callback_data="devices:refresh")]]
+        rows = [[InlineKeyboardButton(text="🔄 Обновить список", callback_data="devices:refresh")]]
     else:
         rows.append([InlineKeyboardButton(text="🔄 Обновить список", callback_data="devices:refresh")])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def plans_inline_keyboard(telegram_id: int, plans: list[dict[str, Any]]) -> InlineKeyboardMarkup:
-    """
-    Инлайн-клавиатура тарифов. Кнопки "Купить" (пока заглушка под Stars).
-    callback_data: plan_buy:<code> или plan_buy_t:<token> если слишком длинно.
-    """
+async def configs_inline_keyboard(peers: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    user_map = _PLAN_MAP.setdefault(telegram_id, {})
 
-    for p in plans:
-        code = str(p.get("code", "")).strip()
-        name = str(p.get("name", "")).strip() or code or "plan"
-        is_active = bool(p.get("is_active", True))
+    rows.append([InlineKeyboardButton(text="➕ Добавить устройство", callback_data="cfg:add")])
+    rows.append([InlineKeyboardButton(text="🔄 Обновить список", callback_data="cfg:refresh")])
 
-        if not code:
+    for p in peers:
+        client_id = str(p.get("client_id", "")).strip()
+        client_name = str(p.get("client_name", "")).strip() or "device"
+        location_code = str(p.get("location_code", "")).strip()
+        is_active_peer = bool(p.get("is_active", True))
+
+        if not client_id:
             continue
-        if not is_active:
-            continue
 
-        # Сохраняем план в память по code (для обычной ветки plan_buy:<code>)
-        user_map[code] = p
+        token = await register_client_id_for_callback(client_id)
 
-        btn_text = f"Купить: {name}"
-        cb_data = f"plan_buy:{code}"
+        title = client_name
+        if location_code:
+            title += f" ({location_code})"
+        if not is_active_peer:
+            title += " ⛔"
 
-        # лимит callback 64 байта
-        if len(cb_data.encode("utf-8")) > TG_CALLBACK_LIMIT:
-            # на всякий случай: токенизируем code и сохраняем план по token тоже
-            token = hashlib.sha1(code.encode("utf-8", errors="ignore")).hexdigest()[:12]
-            user_map[token] = p
-            cb_data = f"plan_buy_t:{token}"
-
-        rows.append([InlineKeyboardButton(text=btn_text, callback_data=cb_data)])
-
-    _trim_user_map(user_map)
-
-    if not rows:
-        rows = [[InlineKeyboardButton(text="Обновить тарифы", callback_data="plans:refresh")]]
-    else:
-        rows.append([InlineKeyboardButton(text="🔄 Обновить тарифы", callback_data="plans:refresh")])
+        rows.append(
+            [
+                InlineKeyboardButton(text=f"⬇️ .conf: {title}", callback_data=f"cfg:dl:{token}"),
+                InlineKeyboardButton(text=f"📷 QR: {title}", callback_data=f"cfg:qr:{token}"),
+            ]
+        )
+        rows.append([InlineKeyboardButton(text=f"🗑 Удалить: {title}", callback_data=f"cfg:rv:{token}")])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ------------------------------------------------------
-# HTTP: обработка ошибок backend
+# QR генерация
+# ------------------------------------------------------
+
+def build_qr_png_bytes(text: str) -> bytes:
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=8,
+        border=2,
+    )
+    qr.add_data(text)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    bio = io.BytesIO()
+    img.save(bio, format="PNG")
+    return bio.getvalue()
+
+
+def safe_filename(name: str, default: str = "wireguard.conf") -> str:
+    n = (name or "").strip()
+    if not n:
+        return default
+    n = re.sub(r"[^0-9a-zA-Zа-яА-Я _\-\.\(\)]", "_", n)
+    n = n.strip()
+    if not n:
+        return default
+    if not n.lower().endswith(".conf"):
+        n += ".conf"
+    return n
+
+
+# ------------------------------------------------------
+# HTTP: backend клиент
 # ------------------------------------------------------
 
 class BackendError(RuntimeError):
-    """Человекочитаемая ошибка backend для вывода пользователю."""
+    pass
 
 
 def _extract_backend_detail(payload: Any, status_code: int) -> str:
@@ -261,15 +331,9 @@ def _extract_backend_detail(payload: Any, status_code: int) -> str:
         detail = payload.get("detail")
         if isinstance(detail, str) and detail.strip():
             return detail.strip()
-
         msg = payload.get("message")
         if isinstance(msg, str) and msg.strip():
             return msg.strip()
-
-        err = payload.get("error")
-        if isinstance(err, str) and err.strip():
-            return err.strip()
-
     return f"Ошибка backend (HTTP {status_code})"
 
 
@@ -280,21 +344,15 @@ async def call_backend(
     params: Optional[dict] = None,
     timeout: Optional[float] = None,
 ) -> dict:
-    """Универсальная функция для запросов к backend."""
     base = BACKEND_BASE_URL.rstrip("/")
     url = base + path
     logger.info("Backend request: %s %s", method.upper(), url)
 
-    client = await _ensure_http_client()
+    t = httpx.Timeout(timeout or BACKEND_TIMEOUT, connect=BACKEND_CONNECT_TIMEOUT)
 
     try:
-        resp = await client.request(
-            method=method,
-            url=url,
-            json=json,
-            params=params,
-            timeout=_get_http_timeout(timeout),
-        )
+        async with httpx.AsyncClient(timeout=t) as client:
+            resp = await client.request(method=method, url=url, json=json, params=params)
     except httpx.ConnectError as exc:
         logger.warning("Backend connect error: %s", exc)
         raise BackendError("Сервер временно недоступен. Попробуйте позже.") from exc
@@ -305,12 +363,10 @@ async def call_backend(
         logger.exception("Backend unexpected error: %s", exc)
         raise BackendError("Ошибка соединения с сервером. Попробуйте позже.") from exc
 
-    payload: Any
     try:
         payload = resp.json()
     except Exception:
-        snippet = (resp.text or "")[:500]
-        logger.warning("Backend returned non-JSON (HTTP %s): %s", resp.status_code, snippet)
+        logger.warning("Backend returned non-JSON: %s", resp.text[:500])
         raise BackendError(f"Сервер вернул некорректный ответ (HTTP {resp.status_code}).")
 
     if resp.status_code >= 400:
@@ -320,109 +376,71 @@ async def call_backend(
 
     if not isinstance(payload, dict):
         raise BackendError("Сервер вернул неожиданный формат данных.")
-
     return payload
 
 
 # ------------------------------------------------------
-# Helpers
+# Текст инструкции
 # ------------------------------------------------------
 
-_DEVICE_SAFE_RE = re.compile(r"[^a-zA-Z0-9_\-\.]+")
-
-
-def make_safe_device_name(first_name: Optional[str], telegram_id: int) -> str:
-    """
-    Делает стабильное, читабельное и безопасное имя устройства.
-    Ограничиваем длину, убираем проблемные символы.
-    """
-    base = (first_name or "device").strip()
-    if not base:
-        base = "device"
-
-    base = base.replace(" ", "_")
-    base = _DEVICE_SAFE_RE.sub("", base)
-    if not base:
-        base = "device"
-
-    base = base[:24]
-    return f"{base}_{telegram_id}"
-
-
-def truncate_for_tg(text: str, limit: int = TG_MSG_LIMIT) -> str:
-    if len(text) <= limit:
-        return text
-    cut = max(0, limit - 80)
-    return text[:cut] + "\n...\n(Сообщение обрезано. Используйте файл .conf)"
-
-
-async def fetch_plans_from_backend() -> list[dict[str, Any]]:
-    """
-    Пытаемся получить тарифы из backend.
-    Поддерживаем несколько путей (на случай разных реализаций):
-      - /api/v1/subscription-plans/active
-      - /api/v1/subscription-plans
-      - /api/v1/plans/active
-    Ожидаем ответ:
-      - {"plans": [...]} или {"items": [...]} или {"data": [...]} — нормализуем.
-    """
-    candidate_paths = [
-        "/api/v1/subscription-plans/active",
-        "/api/v1/subscription-plans",
-        "/api/v1/plans/active",
+def build_instruction_text() -> str:
+    lines = [
+        "<b>Инструкция по подключению WireGuard</b>",
+        "",
+        "<b>Вариант A — через QR-код (быстрее)</b>",
+        "1) Установите приложение <b>WireGuard</b>:",
+        "   • Android: Google Play / RuStore (если доступно)",
+        "   • iPhone: App Store",
+        "   • Windows/macOS: с официального сайта WireGuard",
+        "2) В боте откройте: <b>🔐 Конфиги WireGuard</b>",
+        "3) Нажмите кнопку <b>📷 QR</b> напротив нужного устройства",
+        "4) В приложении WireGuard нажмите <b>+</b> → <b>Сканировать QR-код</b>",
+        "5) Сохраните туннель и включите переключатель (VPN ON).",
+        "",
+        "<b>Вариант B — через файл .conf</b>",
+        "1) В боте откройте: <b>🔐 Конфиги WireGuard</b>",
+        "2) Нажмите <b>⬇️ .conf</b> — бот пришлёт файл конфигурации",
+        "3) Импортируйте конфиг:",
+        "   • Android: WireGuard → <b>+</b> → <b>Импорт из файла</b> → выберите .conf",
+        "   • iPhone: WireGuard → <b>+</b> → <b>Create from file or archive</b> → выберите .conf",
+        "   • Windows: WireGuard → <b>Add Tunnel</b> → <b>Import tunnel(s) from file</b>",
+        "   • macOS: WireGuard → <b>Import tunnel(s) from file</b>",
+        "4) Включите туннель.",
+        "",
+        "<b>Если не подключается</b>",
+        "• Проверьте, что туннель включён и нет другого VPN одновременно.",
+        "• Попробуйте выключить/включить Wi-Fi/мобильную сеть.",
+        "• Удалите туннель и импортируйте заново.",
+        "• Если проблема сохраняется — напишите в поддержку (раздел «ℹ️ О проекте»).",
     ]
-
-    last_error: Optional[str] = None
-
-    for path in candidate_paths:
-        try:
-            data = await call_backend(method="GET", path=path)
-        except BackendError as exc:
-            last_error = str(exc)
-            continue
-        except Exception as exc:
-            last_error = f"unexpected error: {exc}"
-            continue
-
-        plans: Any = None
-        if isinstance(data, dict):
-            if "plans" in data:
-                plans = data.get("plans")
-            elif "items" in data:
-                plans = data.get("items")
-            elif "data" in data:
-                plans = data.get("data")
-
-        if isinstance(plans, list):
-            result: list[dict[str, Any]] = []
-            for p in plans:
-                if isinstance(p, dict):
-                    result.append(p)
-            return result
-
-        if isinstance(data, list):
-            result2: list[dict[str, Any]] = []
-            for p in data:
-                if isinstance(p, dict):
-                    result2.append(p)
-            return result2
-
-        last_error = "Сервер вернул неожиданный формат тарифов."
-
-    raise BackendError(
-        "Не удалось получить список тарифов. "
-        "Вероятно, в backend ещё не реализован публичный эндпоинт тарифов. "
-        f"Последняя ошибка: {last_error or 'нет деталей'}"
-    )
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------
-# Хэндлеры
+# Хранилище последнего платежа (in-memory)
+# ------------------------------------------------------
+
+_last_payment_lock = asyncio.Lock()
+_last_payment: dict[str, Any] = {}
+
+
+async def set_last_payment(data: dict[str, Any]) -> None:
+    async with _last_payment_lock:
+        _last_payment.clear()
+        _last_payment.update(data)
+
+
+async def get_last_payment() -> dict[str, Any]:
+    async with _last_payment_lock:
+        return dict(_last_payment)
+
+
+# ------------------------------------------------------
+# /start
 # ------------------------------------------------------
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    """Обработка команды /start."""
     user = message.from_user
     if user is None:
         await message.answer("Не удалось определить пользователя Telegram.")
@@ -444,28 +462,16 @@ async def cmd_start(message: Message) -> None:
         await message.answer(
             "Произошла ошибка при обращении к серверу.\n"
             f"{html.escape(str(exc))}",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(user.id),
         )
         return
     except Exception:
         logger.exception("Unexpected error in /start")
         await message.answer(
             "Произошла непредвиденная ошибка. Попробуйте ещё раз позже.",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(user.id),
         )
         return
-
-    greeting = [
-        f"Привет, <b>{html.escape(user.full_name)}</b>.",
-        "",
-        "Это VPN-бот. Здесь можно:",
-        "• посмотреть статус подписки;",
-        "• выбрать тариф и подготовиться к оплате;",
-        "• активировать бесплатный пробный период (1 раз);",
-        "• получить конфигурацию WireGuard;",
-        "• управлять устройствами (посмотреть и отключить).",
-        "",
-    ]
 
     has_sub = bool(backend_resp.get("has_active_subscription", False))
     is_trial_active = bool(backend_resp.get("is_trial_active", False))
@@ -473,39 +479,280 @@ async def cmd_start(message: Message) -> None:
     trial_available = bool(backend_resp.get("trial_available", False))
     plan_name = backend_resp.get("active_plan_name")
 
+    greeting = [
+        f"Привет, <b>{html.escape(user.full_name)}</b>.",
+        "",
+        "Я помогу подключить VPN (WireGuard).",
+        "",
+        "Основные разделы:",
+        "• <b>🔐 Конфиги WireGuard</b> — скачать .conf или получить QR;",
+        "• <b>📊 Статус подписки</b> — проверить тариф;",
+        "• <b>🎁 Активировать триал</b> — 10 дней (если доступно);",
+        "• <b>📖 Инструкция подключения</b> — пошагово.",
+        "",
+    ]
+
     if has_sub:
         plan_label = plan_name or "активный тариф"
-        greeting.append(f"Сейчас у вас есть <b>{html.escape(str(plan_label))}</b>.")
+        greeting.append(f"Текущий тариф: <b>{html.escape(str(plan_label))}</b>.")
         greeting.append("Тип: <b>бесплатный пробный период</b>." if is_trial_active else "Тип: <b>платная подписка</b>.")
         if ends_at:
-            greeting.append(f"Действует до: <code>{html.escape(str(ends_at))}</code>.")
+            greeting.append(f"Действует до: <code>{html.escape(str(ends_at))}</code> (UTC).")
+        else:
+            greeting.append("Срок действия: <b>без ограничения</b>.")
     else:
         greeting.append("У вас пока нет активной подписки.")
         if trial_available:
-            greeting.append("Вы можете активировать <b>бесплатный пробный период на 10 дней</b>.")
+            greeting.append("Можно активировать <b>бесплатный пробный период на 10 дней</b>.")
 
     greeting.append("")
-    greeting.append("Выберите пункт меню ниже.")
+    greeting.append("Выберите действие в меню ниже.")
 
-    await message.answer("\n".join(greeting), reply_markup=main_menu_keyboard())
+    await message.answer("\n".join(greeting), reply_markup=main_menu_keyboard(user.id))
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
     text = (
         "<b>Справка по боту</b>\n\n"
-        "Основные возможности:\n"
-        "• «📊 Мой тариф и статус VPN» — текущий тариф и срок действия;\n"
-        "• «💳 Тарифы и оплата» — список тарифов (подготовка к оплате/Stars);\n"
-        "• «🎁 Активировать бесплатный период» — триал на 10 дней (один раз);\n"
-        "• «🔐 Получить конфиг WireGuard» — выдача/обновление конфига (только при активной подписке);\n"
-        "• «📱 Мои устройства» — список устройств и возможность отключить;\n"
-        "• «ℹ️ О проекте» — информация о сервисе.\n"
+        "• «📊 Статус подписки» — тариф/срок;\n"
+        "• «🎁 Активировать триал» — пробный период (если доступно);\n"
+        "• «🔐 Конфиги WireGuard» — .conf и QR, добавить/удалить устройства;\n"
+        "• «📱 Устройства» — список и отключение;\n"
+        "• «📖 Инструкция подключения» — как подключить WireGuard.\n\n"
+        "Команды:\n"
+        "• /start\n"
+        "• /help\n"
+        "• /instruction\n"
     )
-    await message.answer(text, reply_markup=main_menu_keyboard())
+    await message.answer(text, reply_markup=main_menu_keyboard(user_id))
 
 
-@dp.message(F.text == "📊 Мой тариф и статус VPN")
+@dp.message(Command("instruction"))
+async def cmd_instruction(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    await message.answer(build_instruction_text(), reply_markup=main_menu_keyboard(user_id))
+
+
+# ------------------------------------------------------
+# Админ: вход в меню платежей/подписок
+# ------------------------------------------------------
+
+@dp.message(F.text == "🛡 Админ: Платежи/подписки")
+async def handle_admin_payments_menu(message: Message) -> None:
+    user = message.from_user
+    if user is None or not is_admin(user.id):
+        await message.answer("Доступ запрещён.", reply_markup=main_menu_keyboard(user.id if user else None))
+        return
+
+    text = (
+        "<b>Админ-панель: Платежи и подписки</b>\n\n"
+        "Доступные действия:\n"
+        "• посмотреть тарифы (как видит их бот);\n"
+        "• проверить статус подписки по Telegram ID;\n"
+        "• вручную подтвердить Stars оплату (payload/charge_id);\n"
+        "• посмотреть данные последнего платежа из логики бота."
+    )
+    await message.answer(text, reply_markup=admin_payments_keyboard())
+
+
+@dp.message(F.text == "⬅️ Назад в меню")
+async def handle_back_to_main(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    await message.answer("Главное меню.", reply_markup=main_menu_keyboard(user_id))
+
+
+@dp.message(F.text == "🧾 Планы (backend)")
+async def admin_plans(message: Message) -> None:
+    user = message.from_user
+    if user is None or not is_admin(user.id):
+        await message.answer("Доступ запрещён.", reply_markup=main_menu_keyboard(user.id if user else None))
+        return
+
+    try:
+        data = await call_backend(method="GET", path="/api/v1/subscription-plans/active")
+    except Exception as exc:
+        await message.answer(f"Ошибка загрузки планов: {html.escape(str(exc))}", reply_markup=admin_payments_keyboard())
+        return
+
+    plans = data.get("plans") or []
+    if not isinstance(plans, list) or not plans:
+        await message.answer("Планы не найдены.", reply_markup=admin_payments_keyboard())
+        return
+
+    lines = ["<b>Активные тарифы (backend)</b>", ""]
+    for p in plans:
+        if not isinstance(p, dict):
+            continue
+        code = html.escape(str(p.get("code") or ""))
+        name = html.escape(str(p.get("name") or ""))
+        days = html.escape(str(p.get("duration_days") or ""))
+        stars = html.escape(str(p.get("price_stars") or ""))
+        is_trial_plan = bool(p.get("is_trial", False))
+        max_dev = p.get("max_devices", None)
+        max_dev_str = "∞" if max_dev in (None, 0, "") else html.escape(str(max_dev))
+        flag = "🎁" if is_trial_plan else "⭐"
+        lines.append(f"{flag} <b>{name}</b> — <code>{code}</code> — {days} дней — {stars} Stars — max_devices: {max_dev_str}")
+
+    await message.answer("\n".join(lines), reply_markup=admin_payments_keyboard())
+
+
+@dp.message(F.text == "🔎 Проверить подписку (TG ID)")
+async def admin_check_sub_prompt(message: Message) -> None:
+    user = message.from_user
+    if user is None or not is_admin(user.id):
+        await message.answer("Доступ запрещён.", reply_markup=main_menu_keyboard(user.id if user else None))
+        return
+    await set_pending(user.id, "admin_check_sub")
+    await message.answer("Введите Telegram ID пользователя (число).", reply_markup=admin_payments_keyboard())
+
+
+@dp.message(F.text == "✅ Подтвердить Stars оплату (payload)")
+async def admin_confirm_payment_prompt(message: Message) -> None:
+    user = message.from_user
+    if user is None or not is_admin(user.id):
+        await message.answer("Доступ запрещён.", reply_markup=main_menu_keyboard(user.id if user else None))
+        return
+    await set_pending(user.id, "admin_confirm_payment")
+    await message.answer(
+        "Отправьте одной строкой данные для подтверждения.\n\n"
+        "Формат:\n"
+        "<code>telegram_id|invoice_payload|telegram_payment_charge_id|provider_payment_charge_id|amount</code>\n\n"
+        "Пример:\n"
+        "<code>123456|vpn_plan:m1_69:123456:1700000000|abc123|def456|69</code>\n\n"
+        "provider_payment_charge_id можно оставить пустым, но разделители должны быть:\n"
+        "<code>123456|vpn_plan:m1_69:123456:...|abc123||69</code>",
+        reply_markup=admin_payments_keyboard(),
+    )
+
+
+@dp.message(F.text == "🕘 Последний платёж")
+async def admin_last_payment(message: Message) -> None:
+    user = message.from_user
+    if user is None or not is_admin(user.id):
+        await message.answer("Доступ запрещён.", reply_markup=main_menu_keyboard(user.id if user else None))
+        return
+
+    data = await get_last_payment()
+    if not data:
+        await message.answer("Пока нет сохранённых данных о платежах (successful_payment).", reply_markup=admin_payments_keyboard())
+        return
+
+    lines = ["<b>Последний successful_payment (в памяти бота)</b>", ""]
+    for k in ("telegram_id", "currency", "total_amount", "invoice_payload", "telegram_payment_charge_id", "provider_payment_charge_id"):
+        if k in data:
+            lines.append(f"{html.escape(k)}: <code>{html.escape(str(data.get(k) or ''))}</code>")
+
+    lines.append("")
+    lines.append("Если нужно — используйте «✅ Подтвердить Stars оплату (payload)» и вставьте данные выше.")
+    await message.answer("\n".join(lines), reply_markup=admin_payments_keyboard())
+
+
+# ------------------------------------------------------
+# Обработчик ввода админ-данных
+# ------------------------------------------------------
+
+@dp.message(F.text)
+async def handle_text_inputs(message: Message) -> None:
+    user = message.from_user
+    if user is None:
+        return
+
+    pending = await peek_pending(user.id)
+    if not pending:
+        return
+
+    # Снимаем pending сразу, чтобы не было повторов при ошибках
+    pending = await pop_pending(user.id)
+    if not pending:
+        return
+
+    text = (message.text or "").strip()
+
+    if pending.action == "admin_check_sub":
+        try:
+            tid = int(text)
+        except Exception:
+            await message.answer("Ошибка: нужен Telegram ID числом. Повторите команду.", reply_markup=admin_payments_keyboard())
+            return
+
+        try:
+            data = await call_backend(method="GET", path=f"/api/v1/users/{tid}/subscription/active")
+        except Exception as exc:
+            await message.answer(f"Ошибка запроса: {html.escape(str(exc))}", reply_markup=admin_payments_keyboard())
+            return
+
+        has_sub = bool(data.get("has_active_subscription", False))
+        is_trial_active = bool(data.get("is_trial_active", False))
+        ends_at = data.get("subscription_ends_at")
+        plan_name = data.get("active_plan_name")
+        trial_available = bool(data.get("trial_available", False))
+
+        lines = [f"<b>Статус подписки пользователя</b> <code>{tid}</code>", ""]
+        if has_sub:
+            lines.append(f"Тариф: <b>{html.escape(str(plan_name or 'активный тариф'))}</b>")
+            lines.append("Тип: <b>триал</b>" if is_trial_active else "Тип: <b>платная подписка</b>")
+            if ends_at:
+                lines.append(f"До: <code>{html.escape(str(ends_at))}</code> (UTC)")
+            else:
+                lines.append("До: <b>без ограничения</b>")
+        else:
+            lines.append("Активной подписки нет.")
+            lines.append("Триал доступен: <b>да</b>" if trial_available else "Триал доступен: <b>нет</b>")
+
+        await message.answer("\n".join(lines), reply_markup=admin_payments_keyboard())
+        return
+
+    if pending.action == "admin_confirm_payment":
+        parts = text.split("|")
+        if len(parts) != 5:
+            await message.answer("Ошибка формата. Нужно 5 частей через |. Повторите команду.", reply_markup=admin_payments_keyboard())
+            return
+
+        raw_tid, invoice_payload, tg_charge_id, provider_charge_id, raw_amount = [p.strip() for p in parts]
+
+        try:
+            tid = int(raw_tid)
+        except Exception:
+            await message.answer("Ошибка: telegram_id должен быть числом.", reply_markup=admin_payments_keyboard())
+            return
+
+        try:
+            amount = int(raw_amount)
+        except Exception:
+            amount = None
+
+        req = {
+            "telegram_id": tid,
+            "invoice_payload": invoice_payload,
+            "currency": "XTR",
+            "amount": amount,
+            "telegram_payment_charge_id": tg_charge_id,
+            "provider_payment_charge_id": provider_charge_id or None,
+        }
+
+        try:
+            resp = await call_backend(method="POST", path="/api/v1/payments/stars/confirm", json=req)
+        except Exception as exc:
+            await message.answer(f"Ошибка подтверждения: {html.escape(str(exc))}", reply_markup=admin_payments_keyboard())
+            return
+
+        msg = resp.get("message") or "Готово."
+        ok = bool(resp.get("success", True))
+        await message.answer(
+            f"{'✅' if ok else '⚠️'} {html.escape(str(msg))}",
+            reply_markup=admin_payments_keyboard(),
+        )
+        return
+
+
+# ------------------------------------------------------
+# Статус / Триал / Инструкция / Конфиги / Устройства
+# (оставлено как было, только reply_markup теперь с main_menu_keyboard(user.id))
+# ------------------------------------------------------
+
+@dp.message(F.text == "📊 Статус подписки")
 async def handle_status(message: Message) -> None:
     user = message.from_user
     if user is None:
@@ -513,16 +760,13 @@ async def handle_status(message: Message) -> None:
         return
 
     try:
-        data = await call_backend(
-            method="GET",
-            path=f"/api/v1/users/{user.id}/subscription/active",
-        )
+        data = await call_backend(method="GET", path=f"/api/v1/users/{user.id}/subscription/active")
     except BackendError as exc:
-        await message.answer(html.escape(str(exc)), reply_markup=main_menu_keyboard())
+        await message.answer(html.escape(str(exc)), reply_markup=main_menu_keyboard(user.id))
         return
     except Exception:
         logger.exception("Unexpected error in status")
-        await message.answer("Ошибка при запросе статуса. Попробуйте позже.", reply_markup=main_menu_keyboard())
+        await message.answer("Ошибка при запросе статуса. Попробуйте позже.", reply_markup=main_menu_keyboard(user.id))
         return
 
     has_sub = bool(data.get("has_active_subscription", False))
@@ -531,205 +775,27 @@ async def handle_status(message: Message) -> None:
     plan_name = data.get("active_plan_name")
     trial_available = bool(data.get("trial_available", False))
 
-    lines = ["<b>Ваш статус VPN-подписки:</b>", ""]
+    lines = ["<b>Ваш статус подписки:</b>", ""]
 
     if has_sub:
         plan_str = plan_name or "активный тариф"
-        lines.append(f"Текущий тариф: <b>{html.escape(str(plan_str))}</b>.")
-        lines.append("Тип: <b>бесплатный пробный период</b>." if is_trial_active else "Тип: <b>платная подписка</b>.")
+        lines.append(f"Тариф: <b>{html.escape(str(plan_str))}</b>")
+        lines.append("Тип: <b>триал</b>" if is_trial_active else "Тип: <b>платная подписка</b>")
         if ends_at:
-            lines.append(f"Действует до: <code>{html.escape(str(ends_at))}</code>.")
+            lines.append(f"Действует до: <code>{html.escape(str(ends_at))}</code> (UTC)")
+        else:
+            lines.append("Срок действия: <b>без ограничения</b>")
     else:
-        lines.append("У вас нет активной подписки.")
+        lines.append("Активной подписки нет.")
         if trial_available:
-            lines.append("")
             lines.append("Можно активировать <b>бесплатный пробный период на 10 дней</b>.")
         else:
-            lines.append("")
-            lines.append("Бесплатный пробный период уже был использован ранее.")
+            lines.append("Бесплатный пробный период уже был использован.")
 
-    await message.answer("\n".join(lines), reply_markup=main_menu_keyboard())
-
-
-@dp.message(F.text == "💳 Тарифы и оплата")
-async def handle_plans(message: Message) -> None:
-    user = message.from_user
-    if user is None:
-        await message.answer("Не удалось определить пользователя Telegram.", reply_markup=main_menu_keyboard())
-        return
-
-    await message.answer("⏳ Загружаем тарифы...")
-
-    try:
-        plans = await fetch_plans_from_backend()
-    except BackendError as exc:
-        text = (
-            "<b>Тарифы пока недоступны</b>\n\n"
-            f"{html.escape(str(exc))}\n\n"
-            "Что нужно сделать:\n"
-            "• добавить в backend публичный эндпоинт тарифов (например /api/v1/subscription-plans/active);\n"
-            "• возвращать список тарифов (code, name, duration_days, price_stars, max_devices, is_active).\n"
-        )
-        await message.answer(text, reply_markup=main_menu_keyboard())
-        return
-    except Exception:
-        logger.exception("Unexpected error in plans")
-        await message.answer("Ошибка при загрузке тарифов. Попробуйте позже.", reply_markup=main_menu_keyboard())
-        return
-
-    if not plans:
-        await message.answer("Список тарифов пуст. Обратитесь в поддержку.", reply_markup=main_menu_keyboard())
-        return
-
-    lines: list[str] = ["<b>Доступные тарифы:</b>", ""]
-    normalized: list[dict[str, Any]] = []
-
-    for p in plans:
-        if not isinstance(p, dict):
-            continue
-        if not bool(p.get("is_active", True)):
-            continue
-
-        code = str(p.get("code", "")).strip()
-        name = str(p.get("name", "")).strip() or code
-        duration_days = p.get("duration_days")
-        price_stars = p.get("price_stars")
-        max_devices = p.get("max_devices")
-
-        if not code:
-            continue
-
-        normalized.append(p)
-
-        dur_str = f"{duration_days} дн." if isinstance(duration_days, int) else "—"
-        price_str = f"{price_stars} ⭐" if isinstance(price_stars, (int, float)) else "—"
-        dev_str = "безлимит устройств" if max_devices in (None, 0, "") else f"до {max_devices} устройств"
-
-        lines.append(f"• <b>{html.escape(name)}</b> (<code>{html.escape(code)}</code>)")
-        lines.append(
-            f"  Срок: <b>{html.escape(str(dur_str))}</b> | "
-            f"Цена: <b>{html.escape(str(price_str))}</b> | "
-            f"{html.escape(str(dev_str))}"
-        )
-        lines.append("")
-
-    if not normalized:
-        await message.answer("Нет активных тарифов. Обратитесь в поддержку.", reply_markup=main_menu_keyboard())
-        return
-
-    await message.answer("\n".join(lines).strip(), reply_markup=main_menu_keyboard())
-
-    await message.answer(
-        "Выберите тариф для оплаты (Stars будет подключено на следующем шаге):",
-        reply_markup=plans_inline_keyboard(telegram_id=user.id, plans=normalized),
-    )
+    await message.answer("\n".join(lines), reply_markup=main_menu_keyboard(user.id))
 
 
-@dp.callback_query(F.data == "plans:refresh")
-async def cb_refresh_plans(callback: CallbackQuery) -> None:
-    user = callback.from_user
-    if user is None:
-        await callback.answer("Не удалось определить пользователя.", show_alert=True)
-        return
-
-    try:
-        plans = await fetch_plans_from_backend()
-    except BackendError as exc:
-        await callback.answer(str(exc), show_alert=True)
-        return
-    except Exception:
-        logger.exception("Unexpected error in refresh plans")
-        await callback.answer("Ошибка обновления тарифов.", show_alert=True)
-        return
-
-    if not isinstance(plans, list):
-        plans = []
-
-    try:
-        if callback.message:
-            await callback.message.edit_reply_markup(reply_markup=plans_inline_keyboard(telegram_id=user.id, plans=plans))
-    except Exception:
-        pass
-
-    await callback.answer("Тарифы обновлены.")
-
-
-def _resolve_plan(telegram_id: int, callback_data: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
-    """
-    Возвращает (plan_code, plan_dict) по callback_data.
-    Поддерживает:
-      - plan_buy:<code>
-      - plan_buy_t:<token> (plan_dict берется из in-memory map)
-    """
-    user_map = _PLAN_MAP.get(telegram_id, {})
-
-    if callback_data.startswith("plan_buy:"):
-        code = callback_data.split("plan_buy:", 1)[-1].strip()
-        if not code:
-            return None, None
-        plan = user_map.get(code)
-        return code, plan
-
-    if callback_data.startswith("plan_buy_t:"):
-        token = callback_data.split("plan_buy_t:", 1)[-1].strip()
-        if not token:
-            return None, None
-        plan = user_map.get(token)
-        if not isinstance(plan, dict):
-            return None, None
-        code = str(plan.get("code", "")).strip() or None
-        return code, plan
-
-    return None, None
-
-
-@dp.callback_query(F.data.startswith("plan_buy:") | F.data.startswith("plan_buy_t:"))
-async def cb_plan_buy(callback: CallbackQuery) -> None:
-    """
-    Заглушка под оплату Stars.
-    На следующем шаге здесь будет генерация invoice/Stars и запись платежа в backend.
-    """
-    user = callback.from_user
-    if user is None:
-        await callback.answer("Не удалось определить пользователя.", show_alert=True)
-        return
-
-    data = callback.data or ""
-    code, plan = _resolve_plan(telegram_id=user.id, callback_data=data)
-    if not code:
-        await callback.answer("Некорректная кнопка. Обновите тарифы.", show_alert=True)
-        return
-
-    if not isinstance(plan, dict):
-        plan = {}
-
-    name = str(plan.get("name", "")).strip() or code
-    price = plan.get("price_stars")
-    duration = plan.get("duration_days")
-    max_devices = plan.get("max_devices")
-
-    price_str = f"{price} ⭐" if isinstance(price, (int, float)) else "—"
-    dur_str = f"{duration} дней" if isinstance(duration, int) else "—"
-    dev_str = "безлимит устройств" if max_devices in (None, 0, "") else f"до {max_devices} устройств"
-
-    text = (
-        "<b>Оплата тарифа (в разработке)</b>\n\n"
-        f"Тариф: <b>{html.escape(name)}</b>\n"
-        f"Код: <code>{html.escape(code)}</code>\n"
-        f"Срок: <b>{html.escape(dur_str)}</b>\n"
-        f"Лимит: {html.escape(dev_str)}\n"
-        f"Цена: <b>{html.escape(price_str)}</b>\n\n"
-        "Следующий шаг:\n"
-        "• подключаем оплату через Telegram Stars;\n"
-        "• backend будет создавать подписку после успешного платежа.\n"
-    )
-
-    if callback.message:
-        await callback.message.answer(text, reply_markup=main_menu_keyboard())
-    await callback.answer("Оплата будет подключена на следующем шаге.")
-
-
-@dp.message(F.text == "🎁 Активировать бесплатный период")
+@dp.message(F.text == "🎁 Активировать триал")
 async def handle_activate_trial(message: Message) -> None:
     user = message.from_user
     if user is None:
@@ -737,16 +803,13 @@ async def handle_activate_trial(message: Message) -> None:
         return
 
     try:
-        data = await call_backend(
-            method="POST",
-            path=f"/api/v1/users/{user.id}/trial/activate",
-        )
+        data = await call_backend(method="POST", path=f"/api/v1/users/{user.id}/trial/activate")
     except BackendError as exc:
-        await message.answer(html.escape(str(exc)), reply_markup=main_menu_keyboard())
+        await message.answer(html.escape(str(exc)), reply_markup=main_menu_keyboard(user.id))
         return
     except Exception:
         logger.exception("Unexpected error in trial")
-        await message.answer("Ошибка при активации пробного периода. Попробуйте позже.", reply_markup=main_menu_keyboard())
+        await message.answer("Ошибка при активации пробного периода. Попробуйте позже.", reply_markup=main_menu_keyboard(user.id))
         return
 
     success = bool(data.get("success", False))
@@ -757,95 +820,375 @@ async def handle_activate_trial(message: Message) -> None:
     lines: list[str] = []
 
     if success:
-        lines.append("<b>Бесплатный пробный период активирован.</b>")
+        lines.append("<b>Триал активирован.</b>")
         if trial_ends_at:
-            lines.append(f"Действует до: <code>{html.escape(str(trial_ends_at))}</code> (UTC).")
+            lines.append(f"Действует до: <code>{html.escape(str(trial_ends_at))}</code> (UTC)")
         lines.append("")
-        lines.append("Теперь вы можете получить конфиг WireGuard кнопкой «🔐 Получить конфиг WireGuard».")
+        lines.append("Теперь откройте «🔐 Конфиги WireGuard» и добавьте устройство.")
     else:
         if already_had_trial:
-            lines.append("Бесплатный пробный период уже был использован ранее.")
+            lines.append("Триал уже был использован ранее.")
         else:
-            lines.append("Не удалось активировать бесплатный период.")
+            lines.append("Не удалось активировать триал.")
         if message_text:
             lines.append("")
             lines.append(html.escape(message_text))
 
-    await message.answer("\n".join(lines), reply_markup=main_menu_keyboard())
+    await message.answer("\n".join(lines), reply_markup=main_menu_keyboard(user.id))
 
 
-@dp.message(F.text == "🔐 Получить конфиг WireGuard")
-async def handle_get_wireguard_config(message: Message) -> None:
+@dp.message(F.text == "📖 Инструкция подключения")
+async def handle_instruction_menu(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    await message.answer(build_instruction_text(), reply_markup=main_menu_keyboard(user_id))
+
+
+@dp.message(F.text == "🔐 Конфиги WireGuard")
+async def handle_configs(message: Message) -> None:
     user = message.from_user
     if user is None:
         await message.answer("Не удалось определить пользователя Telegram.")
         return
 
-    await message.answer("⏳ Формируем конфигурацию WireGuard...")
-
-    device_name = make_safe_device_name(user.first_name, user.id)
-
     try:
-        data = await call_backend(
-            method="POST",
-            path="/api/v1/vpn/peers/create",
-            json={
-                "telegram_id": user.id,
-                "telegram_username": user.username,
-                "device_name": device_name,
-            },
-        )
+        data = await call_backend(method="GET", path="/api/v1/vpn/peers/list", params={"telegram_id": user.id})
     except BackendError as exc:
-        await message.answer(html.escape(str(exc)), reply_markup=main_menu_keyboard())
+        await message.answer(html.escape(str(exc)), reply_markup=main_menu_keyboard(user.id))
         return
     except Exception:
-        logger.exception("Unexpected error in create peer")
-        await message.answer("Ошибка при обращении к серверу. Попробуйте позже.", reply_markup=main_menu_keyboard())
+        logger.exception("Unexpected error in configs list")
+        await message.answer("Ошибка при получении списка конфигов. Попробуйте позже.", reply_markup=main_menu_keyboard(user.id))
         return
 
-    config_text = data.get("config")
-    client_name = data.get("client_name") or device_name
-    location_code = data.get("location_code") or ""
-    location_name = data.get("location_name") or ""
+    peers = data.get("peers") or []
+    if not isinstance(peers, list):
+        peers = []
 
-    if not config_text:
-        await message.answer(
-            "Сервер вернул успешный статус, но без конфига. Это похоже на ошибку backend.",
-            reply_markup=main_menu_keyboard(),
+    used = len(peers)
+    if _is_unlimited():
+        limit_line = "Лимит устройств: <b>без ограничений</b>"
+    else:
+        limit_line = f"Лимит устройств: <b>{used}/{MAX_CONFIGS_PER_USER}</b>"
+
+    lines = [
+        "<b>Конфиги WireGuard</b>",
+        "",
+        limit_line,
+        "",
+        "Действия:",
+        "• ⬇️ <b>.conf</b> — скачать конфигурацию файлом",
+        "• 📷 <b>QR</b> — отсканировать в WireGuard",
+        "• 🗑 <b>Удалить</b> — отключить устройство",
+        "• ➕ <b>Добавить</b> — создать новое устройство",
+        "",
+        "Если вы не знаете как подключить — откройте «📖 Инструкция подключения».",
+    ]
+
+    await message.answer("\n".join(lines), reply_markup=main_menu_keyboard(user.id))
+    await message.answer("Управление конфигами:", reply_markup=await configs_inline_keyboard(peers))
+
+
+@dp.callback_query(F.data == "cfg:refresh")
+async def cb_configs_refresh(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    if user is None:
+        await callback.answer("Не удалось определить пользователя.", show_alert=True)
+        return
+
+    try:
+        data = await call_backend(method="GET", path="/api/v1/vpn/peers/list", params={"telegram_id": user.id})
+    except BackendError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    except Exception:
+        logger.exception("Unexpected error in cfg refresh")
+        await callback.answer("Ошибка обновления списка.", show_alert=True)
+        return
+
+    peers = data.get("peers") or []
+    if not isinstance(peers, list):
+        peers = []
+
+    try:
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=await configs_inline_keyboard(peers))
+    except Exception:
+        pass
+
+    await callback.answer("Список обновлён.")
+
+
+@dp.callback_query(F.data == "cfg:add")
+async def cb_configs_add(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    if user is None:
+        await callback.answer("Не удалось определить пользователя.", show_alert=True)
+        return
+
+    try:
+        data = await call_backend(method="GET", path="/api/v1/vpn/peers/list", params={"telegram_id": user.id})
+        peers = data.get("peers") or []
+        if not isinstance(peers, list):
+            peers = []
+    except BackendError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    except Exception:
+        logger.exception("Unexpected error in cfg add precheck")
+        await callback.answer("Ошибка. Попробуйте позже.", show_alert=True)
+        return
+
+    if (not _is_unlimited()) and len(peers) >= MAX_CONFIGS_PER_USER:
+        await callback.answer(f"Лимит устройств: {MAX_CONFIGS_PER_USER}. Удалите старое устройство.", show_alert=True)
+        return
+
+    await callback.answer("Создаём новое устройство...")
+
+    safe_first = (user.first_name or "device").strip()
+    device_name = f"{safe_first}_{user.id}_{len(peers) + 1}"
+
+    try:
+        created = await call_backend(
+            method="POST",
+            path="/api/v1/vpn/peers/create",
+            json={"telegram_id": user.id, "telegram_username": user.username, "device_name": device_name},
         )
+    except BackendError as exc:
+        await callback.answer(str(exc), show_alert=True)
         return
+    except Exception:
+        logger.exception("Unexpected error in cfg add/create")
+        await callback.answer("Ошибка создания устройства.", show_alert=True)
+        return
+
+    config_text = created.get("config")
+    client_name = created.get("client_name") or device_name
+    location_code = created.get("location_code") or ""
+    location_name = created.get("location_name") or ""
+
+    if not config_text or not str(config_text).strip():
+        await callback.answer("Создано, но конфиг не получен (ошибка backend).", show_alert=True)
+        return
+
+    filename = safe_filename(f"wg_{user.id}_{client_name}.conf", default=f"wg_{user.id}.conf")
+    conf_bytes = str(config_text).encode("utf-8", errors="replace")
+    conf_file = BufferedInputFile(conf_bytes, filename=filename)
+
+    qr_png = build_qr_png_bytes(str(config_text))
+    qr_file = BufferedInputFile(qr_png, filename="wireguard_qr.png")
 
     meta_lines = [
-        "<b>Конфиг WireGuard готов.</b>",
+        "<b>Новое устройство создано.</b>",
         f"Устройство: <b>{html.escape(str(client_name))}</b>",
     ]
     if location_code or location_name:
-        loc = f"{str(location_code).strip()} {str(location_name).strip()}".strip()
-        meta_lines.append(f"Локация: <code>{html.escape(loc)}</code>")
-    await message.answer("\n".join(meta_lines), reply_markup=main_menu_keyboard())
+        meta_lines.append(
+            f"Локация: <code>{html.escape(str(location_code))}</code> {html.escape(str(location_name))}".strip()
+        )
+    meta_lines.append("")
+    meta_lines.append("Далее:")
+    meta_lines.append("• импортируйте <b>.conf</b> или")
+    meta_lines.append("• откройте WireGuard → <b>+</b> → <b>Сканировать QR</b>.")
 
-    filename = f"wg_{user.id}.conf"
-    file_bytes = str(config_text).encode("utf-8", errors="replace")
-    doc = BufferedInputFile(file_bytes, filename=filename)
+    try:
+        if callback.message:
+            await callback.message.answer("\n".join(meta_lines), reply_markup=main_menu_keyboard(user.id))
+
+        await bot.send_document(
+            chat_id=user.id,
+            document=conf_file,
+            caption="Файл конфигурации WireGuard (.conf).",
+        )
+        await bot.send_photo(
+            chat_id=user.id,
+            photo=qr_file,
+            caption="QR-код для добавления туннеля в WireGuard.",
+        )
+    except Exception:
+        logger.exception("Failed to send config/qr")
+        if callback.message:
+            conf_escaped = html.escape(str(config_text))
+            await callback.message.answer(
+                "<b>Конфиг WireGuard:</b>\n\n"
+                f"<pre>{conf_escaped}</pre>\n",
+                reply_markup=main_menu_keyboard(user.id),
+            )
+
+    try:
+        data2 = await call_backend(method="GET", path="/api/v1/vpn/peers/list", params={"telegram_id": user.id})
+        peers2 = data2.get("peers") or []
+        if not isinstance(peers2, list):
+            peers2 = []
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=await configs_inline_keyboard(peers2))
+    except Exception:
+        pass
+
+
+async def _get_peer_config_from_backend(user_id: int, client_id: str) -> dict:
+    data = await call_backend(
+        method="GET",
+        path="/api/v1/vpn/peers/config",
+        params={"telegram_id": user_id, "client_id": client_id},
+    )
+    return data
+
+
+@dp.callback_query(F.data.startswith("cfg:dl:"))
+async def cb_configs_download(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    if user is None:
+        await callback.answer("Не удалось определить пользователя.", show_alert=True)
+        return
+
+    token = (callback.data or "").split("cfg:dl:", 1)[-1].strip()
+    if not token:
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+
+    client_id = await resolve_client_id_from_callback(token)
+    if not client_id:
+        await callback.answer("Ссылка устарела. Нажмите «Обновить список».", show_alert=True)
+        return
+
+    await callback.answer("Готовим .conf...")
+
+    try:
+        data = await _get_peer_config_from_backend(user.id, client_id)
+    except BackendError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    except Exception:
+        logger.exception("Unexpected error in cfg download")
+        await callback.answer("Ошибка получения конфига.", show_alert=True)
+        return
+
+    config_text = data.get("config")
+    client_name = data.get("client_name") or "device"
+
+    if not config_text or not str(config_text).strip():
+        await callback.answer("Конфиг не получен (ошибка backend).", show_alert=True)
+        return
+
+    filename = safe_filename(f"wg_{user.id}_{client_name}.conf", default=f"wg_{user.id}.conf")
+    conf_bytes = str(config_text).encode("utf-8", errors="replace")
+    conf_file = BufferedInputFile(conf_bytes, filename=filename)
 
     try:
         await bot.send_document(
-            chat_id=message.chat.id,
-            document=doc,
+            chat_id=user.id,
+            document=conf_file,
             caption="Файл конфигурации WireGuard (.conf).",
         )
+    except Exception:
+        logger.exception("Failed to send .conf as document")
+        if callback.message:
+            conf_escaped = html.escape(str(config_text))
+            await callback.message.answer(f"<b>Ваш конфиг WireGuard:</b>\n\n<pre>{conf_escaped}</pre>\n")
+
+    await callback.answer("Файл отправлен.")
+
+
+@dp.callback_query(F.data.startswith("cfg:qr:"))
+async def cb_configs_qr(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    if user is None:
+        await callback.answer("Не удалось определить пользователя.", show_alert=True)
+        return
+
+    token = (callback.data or "").split("cfg:qr:", 1)[-1].strip()
+    if not token:
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+
+    client_id = await resolve_client_id_from_callback(token)
+    if not client_id:
+        await callback.answer("Ссылка устарела. Нажмите «Обновить список».", show_alert=True)
+        return
+
+    await callback.answer("Готовим QR...")
+
+    try:
+        data = await _get_peer_config_from_backend(user.id, client_id)
+    except BackendError as exc:
+        await callback.answer(str(exc), show_alert=True)
         return
     except Exception:
-        logger.exception("Failed to send document, fallback to text")
+        logger.exception("Unexpected error in cfg qr")
+        await callback.answer("Ошибка получения конфига.", show_alert=True)
+        return
 
-    conf_escaped = html.escape(str(config_text))
-    text = "<b>Ваш конфиг WireGuard:</b>\n\n" + f"<pre>{conf_escaped}</pre>"
-    text = truncate_for_tg(text, TG_MSG_LIMIT)
+    config_text = data.get("config")
+    client_name = data.get("client_name") or "device"
 
-    await message.answer(text, reply_markup=main_menu_keyboard())
+    if not config_text or not str(config_text).strip():
+        await callback.answer("Конфиг не получен (ошибка backend).", show_alert=True)
+        return
+
+    try:
+        qr_png = build_qr_png_bytes(str(config_text))
+        qr_file = BufferedInputFile(qr_png, filename="wireguard_qr.png")
+        caption = (
+            "<b>QR-код для WireGuard</b>\n"
+            f"Устройство: <b>{html.escape(str(client_name))}</b>\n\n"
+            "WireGuard → <b>+</b> → <b>Сканировать QR</b>"
+        )
+        await bot.send_photo(chat_id=user.id, photo=qr_file, caption=caption)
+    except Exception:
+        logger.exception("Failed to send QR")
+        await callback.answer("Не удалось отправить QR. Попробуйте .conf.", show_alert=True)
+        return
+
+    await callback.answer("QR отправлен.")
 
 
-@dp.message(F.text == "📱 Мои устройства")
+@dp.callback_query(F.data.startswith("cfg:rv:"))
+async def cb_configs_revoke(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    if user is None:
+        await callback.answer("Не удалось определить пользователя.", show_alert=True)
+        return
+
+    token = (callback.data or "").split("cfg:rv:", 1)[-1].strip()
+    if not token:
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+
+    client_id = await resolve_client_id_from_callback(token)
+    if not client_id:
+        await callback.answer("Ссылка устарела. Нажмите «Обновить список».", show_alert=True)
+        return
+
+    await callback.answer("Удаляем устройство...")
+
+    try:
+        _ = await call_backend(
+            method="POST",
+            path="/api/v1/vpn/peers/revoke",
+            json={"telegram_id": user.id, "client_id": client_id},
+        )
+    except BackendError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    except Exception:
+        logger.exception("Unexpected error in cfg revoke")
+        await callback.answer("Ошибка удаления устройства.", show_alert=True)
+        return
+
+    try:
+        data = await call_backend(method="GET", path="/api/v1/vpn/peers/list", params={"telegram_id": user.id})
+        peers = data.get("peers") or []
+        if not isinstance(peers, list):
+            peers = []
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=await configs_inline_keyboard(peers))
+    except Exception:
+        pass
+
+    await callback.answer("Устройство удалено.")
+
+
+@dp.message(F.text == "📱 Устройства")
 async def handle_devices(message: Message) -> None:
     user = message.from_user
     if user is None:
@@ -853,17 +1196,13 @@ async def handle_devices(message: Message) -> None:
         return
 
     try:
-        data = await call_backend(
-            method="GET",
-            path="/api/v1/vpn/peers/list",
-            params={"telegram_id": user.id},
-        )
+        data = await call_backend(method="GET", path="/api/v1/vpn/peers/list", params={"telegram_id": user.id})
     except BackendError as exc:
-        await message.answer(html.escape(str(exc)), reply_markup=main_menu_keyboard())
+        await message.answer(html.escape(str(exc)), reply_markup=main_menu_keyboard(user.id))
         return
     except Exception:
         logger.exception("Unexpected error in devices list")
-        await message.answer("Ошибка при получении списка устройств. Попробуйте позже.", reply_markup=main_menu_keyboard())
+        await message.answer("Ошибка при получении списка устройств. Попробуйте позже.", reply_markup=main_menu_keyboard(user.id))
         return
 
     peers = data.get("peers") or []
@@ -871,7 +1210,7 @@ async def handle_devices(message: Message) -> None:
         peers = []
 
     if not peers:
-        await message.answer("У вас пока нет устройств. Сначала получите конфиг WireGuard.", reply_markup=main_menu_keyboard())
+        await message.answer("У вас пока нет устройств. Откройте «🔐 Конфиги WireGuard» и добавьте устройство.", reply_markup=main_menu_keyboard(user.id))
         return
 
     lines = ["<b>Ваши устройства:</b>", ""]
@@ -879,17 +1218,12 @@ async def handle_devices(message: Message) -> None:
         client_name = html.escape(str(p.get("client_name") or "device"))
         client_id = html.escape(str(p.get("client_id") or ""))
         location_code = html.escape(str(p.get("location_code") or ""))
-        is_active = bool(p.get("is_active", True))
-        status_ico = "✅" if is_active else "⛔"
-        loc = f" ({location_code})" if location_code else ""
-        lines.append(f"{i}. {status_ico} <b>{client_name}</b> — <code>{client_id}</code>{loc}")
+        is_active_peer = bool(p.get("is_active", True))
+        status_ico = "✅" if is_active_peer else "⛔"
+        lines.append(f"{i}. {status_ico} <b>{client_name}</b> — <code>{client_id}</code> ({location_code})")
 
-    await message.answer("\n".join(lines), reply_markup=main_menu_keyboard())
-
-    await message.answer(
-        "Управление устройствами:",
-        reply_markup=devices_inline_keyboard(telegram_id=user.id, peers=peers),
-    )
+    await message.answer("\n".join(lines), reply_markup=main_menu_keyboard(user.id))
+    await message.answer("Отключение устройств:", reply_markup=devices_inline_keyboard(peers))
 
 
 @dp.callback_query(F.data == "devices:refresh")
@@ -900,11 +1234,7 @@ async def cb_refresh_devices(callback: CallbackQuery) -> None:
         return
 
     try:
-        data = await call_backend(
-            method="GET",
-            path="/api/v1/vpn/peers/list",
-            params={"telegram_id": user.id},
-        )
+        data = await call_backend(method="GET", path="/api/v1/vpn/peers/list", params={"telegram_id": user.id})
     except BackendError as exc:
         await callback.answer(str(exc), show_alert=True)
         return
@@ -919,45 +1249,24 @@ async def cb_refresh_devices(callback: CallbackQuery) -> None:
 
     try:
         if callback.message:
-            await callback.message.edit_reply_markup(reply_markup=devices_inline_keyboard(telegram_id=user.id, peers=peers))
+            await callback.message.edit_reply_markup(reply_markup=devices_inline_keyboard(peers))
     except Exception:
         pass
 
     await callback.answer("Список обновлён.")
 
 
-def _resolve_revoke_client_id(telegram_id: int, callback_data: str) -> Optional[str]:
-    """
-    Извлекает client_id из callback_data.
-    Поддерживает:
-      - revoke:<client_id>
-      - revoke_t:<token>  (client_id берется из in-memory map)
-    """
-    if callback_data.startswith("revoke:"):
-        client_id = callback_data.split("revoke:", 1)[-1].strip()
-        return client_id or None
-
-    if callback_data.startswith("revoke_t:"):
-        token = callback_data.split("revoke_t:", 1)[-1].strip()
-        if not token:
-            return None
-        user_map = _REVOKE_TOKEN_MAP.get(telegram_id, {})
-        return user_map.get(token)
-
-    return None
-
-
-@dp.callback_query(F.data.startswith("revoke:") | F.data.startswith("revoke_t:"))
+@dp.callback_query(F.data.startswith("revoke:"))
 async def cb_revoke_device(callback: CallbackQuery) -> None:
     user = callback.from_user
     if user is None:
         await callback.answer("Не удалось определить пользователя.", show_alert=True)
         return
 
-    data = callback.data or ""
-    client_id = _resolve_revoke_client_id(telegram_id=user.id, callback_data=data)
+    raw = callback.data or ""
+    client_id = raw.split("revoke:", 1)[-1].strip()
     if not client_id:
-        await callback.answer("Некорректная кнопка/устройство. Обновите список.", show_alert=True)
+        await callback.answer("Некорректный идентификатор устройства.", show_alert=True)
         return
 
     await callback.answer("Отключаем устройство...")
@@ -977,57 +1286,280 @@ async def cb_revoke_device(callback: CallbackQuery) -> None:
         return
 
     try:
-        new_data = await call_backend(
-            method="GET",
-            path="/api/v1/vpn/peers/list",
-            params={"telegram_id": user.id},
-        )
-        peers = new_data.get("peers") or []
+        data = await call_backend(method="GET", path="/api/v1/vpn/peers/list", params={"telegram_id": user.id})
+        peers = data.get("peers") or []
         if not isinstance(peers, list):
             peers = []
-        try:
-            if callback.message:
-                await callback.message.edit_reply_markup(reply_markup=devices_inline_keyboard(telegram_id=user.id, peers=peers))
-        except Exception:
-            pass
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=devices_inline_keyboard(peers))
     except Exception:
         pass
 
     await callback.answer("Устройство отключено.")
 
 
+# ------------------------------------------------------
+# Stars: тарифы и оплата
+# ------------------------------------------------------
+
+async def fetch_active_plans() -> list[dict[str, Any]]:
+    data = await call_backend(method="GET", path="/api/v1/subscription-plans/active")
+    plans = data.get("plans") or []
+    if not isinstance(plans, list):
+        return []
+    result = []
+    for p in plans:
+        if not isinstance(p, dict):
+            continue
+        if bool(p.get("is_trial", False)):
+            continue
+        if not bool(p.get("is_active", True)):
+            continue
+        result.append(p)
+    return result
+
+
+def plans_pay_inline_keyboard(plans: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for p in plans:
+        code = str(p.get("code") or "").strip()
+        name = str(p.get("name") or "Тариф").strip()
+        price_stars = p.get("price_stars")
+        if not code:
+            continue
+
+        try:
+            stars_amount = int(float(str(price_stars)))
+        except Exception:
+            stars_amount = 0
+
+        btn_text = f"⭐ {name} — {stars_amount} Stars"
+        rows.append([InlineKeyboardButton(text=btn_text, callback_data=f"pay:{code}")])
+
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="pay:refresh")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(F.text == "⭐ Купить подписку")
+async def handle_buy_subscription(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    if not STARS_ENABLED:
+        await message.answer("Оплата временно отключена. Попробуйте позже.", reply_markup=main_menu_keyboard(user_id))
+        return
+
+    try:
+        plans = await fetch_active_plans()
+    except BackendError as exc:
+        await message.answer(html.escape(str(exc)), reply_markup=main_menu_keyboard(user_id))
+        return
+    except Exception:
+        logger.exception("Plans load error")
+        await message.answer("Не удалось загрузить тарифы. Попробуйте позже.", reply_markup=main_menu_keyboard(user_id))
+        return
+
+    if not plans:
+        await message.answer("Активные тарифы не найдены. Попробуйте позже.", reply_markup=main_menu_keyboard(user_id))
+        return
+
+    text = (
+        "<b>Оплата подписки через Telegram Stars</b>\n\n"
+        "Выберите тариф ниже. После оплаты я активирую подписку.\n"
+        "Если оплата прошла, а подписка не активировалась — напишите в поддержку.\n\n"
+        "Важно: Stars — внутренняя валюта Telegram. Оплата происходит прямо в Telegram."
+    )
+    await message.answer(text, reply_markup=main_menu_keyboard(user_id))
+    await message.answer("Тарифы:", reply_markup=plans_pay_inline_keyboard(plans))
+
+
+@dp.callback_query(F.data == "pay:refresh")
+async def cb_pay_refresh(callback: CallbackQuery) -> None:
+    if not STARS_ENABLED:
+        await callback.answer("Оплата отключена.", show_alert=True)
+        return
+
+    try:
+        plans = await fetch_active_plans()
+    except Exception:
+        await callback.answer("Не удалось обновить тарифы.", show_alert=True)
+        return
+
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=plans_pay_inline_keyboard(plans))
+        except Exception:
+            pass
+
+    await callback.answer("Обновлено.")
+
+
+@dp.callback_query(F.data.startswith("pay:"))
+async def cb_pay_plan(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    if user is None:
+        await callback.answer("Не удалось определить пользователя.", show_alert=True)
+        return
+
+    if not STARS_ENABLED:
+        await callback.answer("Оплата отключена.", show_alert=True)
+        return
+
+    plan_code = (callback.data or "").split("pay:", 1)[-1].strip()
+    if not plan_code or plan_code == "refresh":
+        await callback.answer("Некорректный тариф.", show_alert=True)
+        return
+
+    try:
+        plans = await fetch_active_plans()
+    except BackendError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    except Exception:
+        await callback.answer("Не удалось загрузить тариф.", show_alert=True)
+        return
+
+    selected = None
+    for p in plans:
+        if str(p.get("code") or "").strip() == plan_code:
+            selected = p
+            break
+
+    if not selected:
+        await callback.answer("Тариф не найден или отключён. Обновите список.", show_alert=True)
+        return
+
+    name = str(selected.get("name") or "VPN тариф").strip()
+    price_stars = selected.get("price_stars")
+
+    try:
+        amount = int(float(str(price_stars)))
+    except Exception:
+        amount = 0
+
+    if amount <= 0:
+        await callback.answer("Некорректная цена тарифа.", show_alert=True)
+        return
+
+    await callback.answer("Открываю оплату...")
+
+    payload = f"{STARS_PAYLOAD_PREFIX}{plan_code}:{user.id}:{int(time.time())}"
+    prices = [LabeledPrice(label=name, amount=amount)]
+
+    try:
+        await bot.send_invoice(
+            chat_id=user.id,
+            title=f"VPN подписка: {name}",
+            description="Оплата подписки VPN через Telegram Stars.",
+            payload=payload,
+            currency=STARS_CURRENCY,
+            prices=prices,
+            provider_token=STARS_PROVIDER_TOKEN,
+            start_parameter=f"{STARS_START_PARAMETER_PREFIX}_{plan_code}",
+            need_name=False,
+            need_phone_number=False,
+            need_email=False,
+            need_shipping_address=False,
+            is_flexible=False,
+        )
+    except Exception:
+        logger.exception("Failed to send invoice")
+        await callback.answer("Не удалось создать счёт. Попробуйте позже.", show_alert=True)
+
+
+@dp.pre_checkout_query()
+async def pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
+    try:
+        await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+    except Exception:
+        logger.exception("pre_checkout answer failed")
+
+
+@dp.message(F.successful_payment)
+async def on_successful_payment(message: Message) -> None:
+    sp = message.successful_payment
+    if sp is None:
+        return
+
+    payload = getattr(sp, "invoice_payload", "") or ""
+    currency = getattr(sp, "currency", "") or ""
+    total_amount = getattr(sp, "total_amount", None)
+    tg_charge_id = getattr(sp, "telegram_payment_charge_id", "") or ""
+    provider_charge_id = getattr(sp, "provider_payment_charge_id", "") or ""
+
+    logger.info("SUCCESSFUL_PAYMENT: currency=%s amount=%s payload=%s", currency, total_amount, payload)
+
+    # сохраняем в память бота для админа
+    try:
+        await set_last_payment(
+            {
+                "telegram_id": (message.from_user.id if message.from_user else None),
+                "currency": currency,
+                "total_amount": total_amount,
+                "invoice_payload": payload,
+                "telegram_payment_charge_id": tg_charge_id,
+                "provider_payment_charge_id": provider_charge_id,
+            }
+        )
+    except Exception:
+        pass
+
+    # Автоподтверждение на backend (если эндпоинт есть)
+    # Если backend ещё не обновлён — будет BackendError, и мы просто покажем пользователю сообщение.
+    try:
+        if currency == "XTR" and payload:
+            user_id = message.from_user.id if message.from_user else None
+            if user_id is not None:
+                req = {
+                    "telegram_id": user_id,
+                    "invoice_payload": payload,
+                    "currency": currency,
+                    "amount": total_amount,
+                    "telegram_payment_charge_id": tg_charge_id,
+                    "provider_payment_charge_id": provider_charge_id or None,
+                }
+                _ = await call_backend(method="POST", path="/api/v1/payments/stars/confirm", json=req)
+    except Exception as exc:
+        logger.warning("Auto-confirm failed: %s", exc)
+
+    await message.answer(
+        "<b>Оплата получена.</b>\n\n"
+        "Подписка будет активирована автоматически.\n"
+        "Если в течение пары минут статус не изменится — напишите в поддержку.",
+        reply_markup=main_menu_keyboard(message.from_user.id if message.from_user else None),
+    )
+
+
+# ------------------------------------------------------
+# О проекте
+# ------------------------------------------------------
+
 @dp.message(F.text == "ℹ️ О проекте")
 async def handle_about(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    limit_line = "без ограничений" if _is_unlimited() else str(MAX_CONFIGS_PER_USER)
     text = (
         "<b>О VPN-проекте</b>\n\n"
         "Сервис предоставляет доступ к VPN на базе WireGuard.\n\n"
-        "Планируется:\n"
-        "• оплата через Telegram Stars;\n"
-        "• выбор страны/сервера;\n"
-        "• несколько тарифов (1/2/3 месяца) и бесплатный триал;\n"
-        "• веб-кабинет и расширенное управление устройствами.\n"
+        "Возможности:\n"
+        "• управление устройствами и конфигами WireGuard;\n"
+        f"• лимит устройств: <b>{limit_line}</b>;\n"
+        "• триал и тарифы (в зависимости от настроек backend).\n\n"
+        "Если нужна помощь — используйте «📖 Инструкция подключения»."
     )
-    await message.answer(text, reply_markup=main_menu_keyboard())
+    await message.answer(text, reply_markup=main_menu_keyboard(user_id))
 
+
+# ------------------------------------------------------
+# Fallback
+# ------------------------------------------------------
 
 @dp.message()
 async def handle_fallback(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
     await message.answer(
-        "Команда не распознана. Используйте меню или /start, /help.",
-        reply_markup=main_menu_keyboard(),
+        "Команда не распознана. Используйте меню или /start, /help, /instruction.",
+        reply_markup=main_menu_keyboard(user_id),
     )
 
-
-# ------------------------------------------------------
-# Lifecycle
-# ------------------------------------------------------
-
-async def on_shutdown(_dispatcher: Dispatcher) -> None:
-    logger.info("Остановка бота: закрываем HTTP-клиент...")
-    await _close_http_client()
-
-
-dp.shutdown.register(on_shutdown)
 
 # ------------------------------------------------------
 # Точка входа
