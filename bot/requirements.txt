@@ -1,13 +1,16 @@
-# ----------------------------------------------------------
-# Версия файла: 1.0.1
-# Описание: Зависимости Python для Telegram-бота (aiogram)
-# Дата изменения: 2025-12-29
-# Изменения:
-#  - 1.0.0: базовый набор (aiogram, python-dotenv)
-#  - 1.0.1: добавлен httpx для общения с backend
-# ----------------------------------------------------------
+
+# Pinned Python dependencies for the VPN Telegram bot
+# Using explicit versions helps ensure reproducible builds.  To update
+# dependencies, edit these version numbers and rebuild your Docker image.
+
+# aiogram: Telegram bot framework (v3.x)
 aiogram==3.13.0
+
+# python-dotenv: load environment variables from .env files
 python-dotenv==1.0.1
+
+# httpx: HTTP client library used for backend calls
 httpx==0.27.2
-qrcode[pil]
-Pillow
+
+# qrcode[pil]: QR code generation with Pillow backend.  Version 8.2 (May 2025).
+qrcode[pil]==8.2
